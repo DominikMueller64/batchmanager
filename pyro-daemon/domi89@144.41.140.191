@@ -1,0 +1,97 @@
+import Pyro4
+import subprocess
+import sys
+import logging
+import os
+import time
+
+import datetime
+import psutil
+import multiprocessing as mp
+
+def get_date():
+    return datetime.datetime.now()
+
+def format_date(date):
+    return date.strftime('%Y-%m-%d %H:%M:%S')
+
+@Pyro4.expose
+class server:
+
+    def __init__(self):
+        self._processes = []
+        self._pid = os.getpid()
+        self.start_date = get_date()
+
+    def start_process(self, cmdlist):
+
+        try:
+            proc = subprocess.Popen(cmdlist, stdout=subprocess.PIPE)
+
+        except (FileNotFoundError, OSError):
+            pass
+        else:
+            proc.start_date = get_date()
+            self.processes.append(proc)
+
+    def get_pid(self):
+        return tuple(proc.pid for proc in self.processes)
+
+    def terminate(self, pid):
+        for proc in self.processes:
+            if proc.pid in pid:
+                proc.terminate()
+
+    def status(self):
+        stringlist = list()
+        fmt_active = '{pid} {dt} {rt}'
+        header_active = 'pid started runtime'
+        header = 'Server (pid: {pid}, started: {dt}'.format(pid=self.pid,
+                                                     dt=format_date(self.start_date))
+        stringlist.extend((header, header_active))
+
+        for proc in self.processes:
+            if proc.poll() is None or proc.poll() == 0:  # Process is still running.
+                tmp = fmt_active.format(pid=proc.pid,
+                                        dt=format_date(proc.start_date),
+                                        # args=' '.join(proc.args),
+                                        rt=str(get_date() - proc.start_date))
+                stringlist.append(tmp)
+
+        return '\n'.join(stringlist)
+
+    @property
+    def processes(self):
+        return self._processes
+
+    @property
+    def pid(self):
+        return self._pid
+
+    @classmethod
+    def virtual_memory(cls):
+        return psutil.virtual_memory()
+
+    @classmethod
+    def load_average(cls):
+        return os.getloadavg()
+
+
+def main():
+    myserver = server()
+    with Pyro4.Daemon() as daemon:
+        myserver_uri = daemon.register(myserver)
+        with Pyro4.locateNS() as ns:
+            ns.register("server_1", myserver_uri)
+        daemon.requestLoop()
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
