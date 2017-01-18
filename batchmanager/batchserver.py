@@ -8,7 +8,6 @@ import psutil
 import multiprocessing
 import warnings
 import socket
-# import uuid
 import shortuuid
 import inspect
 import time
@@ -137,6 +136,8 @@ class server:
         self._cpu_count = multiprocessing.cpu_count()
         self._ip = socket.gethostbyname(daemon.uriFor('myserver').host)  # Not perfect solution.
         self._id = shortuuid.uuid()
+
+        self.lock = threading.RLock()
 
         # Set up logging.
         self.logger = logging.getLogger('.'.join(('server', name)))
