@@ -13,6 +13,16 @@ import time
 import collections
 import pathlib
 import itertools
+import pandas
+import operator
+import pickle
+
+# Global variables.
+
+required_col_names = 'grp priority prefix script args mem'.split()
+job_keys = required_col_names.copy()
+job_keys.insert(0, 'id')
+Job = collections.namedtuple('Job', job_keys)
 
 # Auxiliary function.
 def dict_factory(cursor, row):
@@ -39,6 +49,7 @@ def set_password():
 
 def print_table(table):
     """Print a table"""
+    logger = logging.getLogger('module_logger.print_table')
     col_width = [max(len(str(x)) for x in col) for col in zip(*table)]
     for line in table:
         print(" | ".join("{:{}}".format(x, col_width[i])
@@ -159,7 +170,7 @@ class launcher(threading.Thread):
                         continue
                     with self.manager.queue_lock:
                         job = self.manager.queue.popleft()
-                        server = self.get_avail_server(job['mem'])
+                        server = self.get_avail_server(job.mem)
                         if server is None:
                             self.manager.queue.appendleft(job)  # Add job back.
                             continue  # No server satisfies the requirements.
@@ -469,59 +480,89 @@ class manager(Cmd):
 
         print_table(table)
 
-    @options([make_option('-T', '--ftype', type='str',
+    @options([make_option('-T', '--type', type='str',
                           default='sqlite3', nargs=1,
-                          help='filetype (sqlite3 or txt)')])
+                          help='type (sqlite3, txt, dumped)'),
+              make_option('-C', '--check', action='store_true',
+                          help='Should the existence of the script be checked?')])
     def do_add_jobs(self, args, opts=None):
         logger = logging.getLogger('batchmanager.manager.do_add_jobs')
-        db_path = os.path.expanduser(args.strip())
-        if not os.path.exists(db_path):
-            # warnings.warn('The database could not be located.', RuntimeWarning)
-            # print('The database could not be located.')
-            logger.warning('The database {} could not be located'.format(db_path))
-            return None
 
-        if not opts.ftype in ('sqlite3', 'txt'):
-            logger.warning('The filetype must be one of sqlite3 or txt.')
+        if not opts.type in ('sqlite3', 'txt', 'dumped'):
+            logger.warning('The filetype must be one of "sqlite3", "txt" or "dumped".')
             return
 
-        if opts.ftype == 'sqlite3':
+        # Check existence of the file.
+        db_path = os.path.expanduser(args.strip())
+        if not os.path.exists(db_path):
+             msg = 'The database {} could not be located'.format(db_path)
+             logger.warning(msg)
+             warnings.warn(msg, RuntimeWarning)
+             return
+
+        ## TODO: Program this here properly.
+        if opts.type == 'dumped':
+            with open(file=db_path, mode='rb') as f:
+                try:
+                    jobs = pickle.load(f)
+                except EOFError:
+                    pass  ## Logging + warning must be done.
+                else:
+                    self.queue.extend(jobs)
+                    return
+
+
+        with self.queue_lock:
+            self.queue.extend(jobs)
+
+
+        if opts.type == 'sqlite3':
             import sqlite3
             try:
             # conn = sqlite3.connect(db_path, timeout=5, isolation_level='EXCLUSIVE')
                 with sqlite3.connect(db_path, timeout=5, isolation_level='EXCLUSIVE') as conn:
-                    conn.row_factory = dict_factory
+                    conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
                     query = "SELECT name FROM sqlite_master WHERE type='table';"
                     res = cursor.execute(query).fetchall()
                     if len(res) > 1:
                         warnings.warn('The database contains more than one table, ' +
-                                    'only the first one is used', RuntimeWarning)
+                                      'only the first one is used', RuntimeWarning)
 
                     tn = res[0]['name']
                     # logging.debug('There are currently {} processes.'.format(len(processes)))
-                    query = 'SELECT rowid, * FROM {tn} ORDER BY grp ASC, priority ASC'.format(tn=tn)
+                    query = 'SELECT * FROM {tn} ORDER BY grp ASC, priority ASC'.format(tn=tn)
+                    col_names = {_[0] for _ in cursor.description}
+                    conn.row_factory = dict_factory
+                    cursor = conn.cursor()
                     tbl = cursor.execute(query).fetchall()
-                    # Start processes
+
+                    ## TODO: Here is some bug, this is not working.
+                    # if not col_names.issubset(required_col_names):
+                    #     msg = ('Input from sqlite3 database does not contain ' +
+                    #            'the appropriate columns in its (first) table.')
+                    #     logger.warn(msg)
+                    #     print(msg)
+                    #     return
+
 
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
                 logging.debug('Connecting to database failed')
 
-
-        elif opts.ftype == 'txt':
-            keys = ('grp', 'priority', 'prefix', 'script', 'args', 'mem')
+        elif opts.type == 'txt':
             tbl = list()
             with open(db_path, mode='r') as f:
                 for l in f:
-                    job = dict.fromkeys(keys)
-                    l = l.strip()
-                    for k, c in zip(keys, l.split(':')):
+                    job = dict()
+                    l = l.strip().split(':')
+                    for k, c in zip(required_col_names, l):
                         job[k] = c.strip()
                     tbl.append(job)
 
         ct = itertools.count()
         with self.queue_lock:
             for job in tbl:
+
                 # Check prefix.
                 interpreter, *options = job['prefix'].split()
                 interpreter = os.path.expanduser(interpreter)
@@ -530,20 +571,25 @@ class manager(Cmd):
                 # Check script.
                 script_path = pathlib.Path(job['script'].strip()).expanduser()
                 script = str(pathlib.PurePath(script_path))
-                if not script_path.is_file():
-                    warnings.warn('The script {} is not an existing file. ' +
-                                    'The process is ignored.'.format(script))
-                    continue
+                if opts.check:
+                    if not script_path.is_file():
+                        msg = ('The script {} is not an existing file. ' +
+                               'The process is ignored.'.format(script))
+                        logger.warn(msg)
+                        warnings.warn(msg)
 
                 job['script'] = script
+
                 # Check args.
                 job['args'] = job['args'].split()
                 job['id'] = shortuuid.uuid()
 
+                job = Job(**job)  # Convert to namedtuple
                 self.queue.append(job)
                 next(ct)
 
-        print('Read {0} jobs.'.format(next(ct)))
+        print('Read in {} jobs. '.format(next(ct)) +
+              'The last one is:\n{}.'.format(str(job)))
 
 
     @options([make_option('-L', '--level', type='int',
@@ -567,50 +613,85 @@ class manager(Cmd):
                     status = server.proc_status(id)
                     start = server.proc_start_date(id, format=True)
                     pid = server.proc_pid(id)
-                    script = trim_path(job['script'], opts.level)
-                    args = ' '.join(job['args'])
+                    script = trim_path(job.script, opts.level)
+                    args = ' '.join(job.args)
 
                     if opts.short:
                         tmp = tuple(map(str, (pid, script, args, status)))
                     else:
                         tmp = (str(_) for _ in (pid,
-                                                job['grp'],
-                                                job['priority'],
+                                                job.grp,
+                                                job.priority,
                                                 id,
                                                 ip,
-                                                job['prefix'],
+                                                job.prefix,
                                                 script,
                                                 args,
-                                                job['mem'],
+                                                job.mem,
                                                 start,
                                                 status))
                     table.append(list(tmp))
 
         print_table(table)
 
+
+
+
     @options([make_option('-L', '--level', type='int',
-                          default=2, nargs=1, help='depth of paths')])
-    def do_job_status(self, args, opts=None):
+                          default=2, nargs=1, help='depth of paths'),
+              make_option('-N', '--n', type='int', default=10, nargs=1,
+                          help='The number of jobs displayed.'),
+              make_option('-T', '--tail', action='store_true',
+                          help='Should the queue be printed from bottom?')])
+    def do_jobs(self, args, opts=None):
         table = list()
-        header = ('grp', 'pr.', 'prefix', 'script', 'args', 'mem (MB)')
+        header = job_keys
         table.append(header)
         with self.queue_lock:
             for job in self.queue:
-                tmp = (str(_) for _ in (job['grp'],
-                                        job['priority'],
-                                        job['prefix'],
-                                        trim_path(job['script'], opts.level),
-                                        ' '.join(job['args']),
-                                        job['mem']))
+                tmp = (str(_) for _ in (job.id,
+                                        job.grp,
+                                        job.priority,
+                                        ' '.join(job.prefix),
+                                        trim_path(job.script, opts.level),
+                                        ' '.join(job.args),
+                                        job.mem))
                 table.append(list(tmp))
 
+        n = opts.n
+        if opts.tail:
+            table = table[-n:]
+        else:
+            table = table[:n + 1]
+
         print_table(table)
+        # print(pandas.DataFrame(table[:opts.head]))
 
     def do_quit(self, arg):
-        self.launcher.stop()  # Send stop signal to launcher.
-        self.launcher.join()  # Wait for the launcher thread to stop.
-        self.launcher.status()  # See if launcher really stopped.
+        print('Stopping.')
+        if self.launcher:
+            self.launcher.stop()  # Send stop signal to launcher.
+            self.launcher.join()  # Wait for the launcher thread to stop.
+            self.launcher.status()  # See if launcher really stopped.
+
+        if self.queue:
+            ans = input('There are still {} jobs enqueued. '.format(len(self.queue)) +
+                        'Store them on hard disk for later usage? [y/n]: ')
+
+            if ans == 'y':
+                # string = pickle.dumps(self.queue)
+                timestamp = time.strftime('%Y-%m-%d_%H:%M:%S')
+                path = os.path.join('.', 'dumped_jobs_' + timestamp)
+
+                with open(file=path, mode='wb') as f:
+                    pickle.dump(self.queue, f)
+
+                print('Extant jobs were dumped to: ' + path)
+
         return self._STOP_AND_EXIT  # Send stop signal to cmd2
+
+    do_q = do_quit
+    do_exit = do_quit
 
 
 def main():

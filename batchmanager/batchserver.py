@@ -38,7 +38,7 @@ class process:
         self._start_fmt = format_date(self._start)
         self._host_name = socket.gethostname()
         self._ip = Pyro4.socketutil.getIpAddress(None, workaround127=True)
-        self._id = job['id'] 
+        self._id = job.id 
         self._proc = proc
         self._job = job
         self._status = None
@@ -234,9 +234,9 @@ class server:
         fun_name = inspect.currentframe().f_code.co_name
         logger = logging.getLogger('.'.join((self.logger.name, fun_name)))
 
-        prefix = job['prefix']
-        script = job['script']
-        args = job['args']
+        prefix = job.prefix
+        script = job.script
+        args = job.args
         cmdlist = [*prefix, script, *args]
 
         # cmdlist = ['Rscript', '--vanilla', './R_test.R', 'adf']
