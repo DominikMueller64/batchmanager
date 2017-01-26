@@ -563,6 +563,10 @@ class manager(Cmd):
                     l = l.strip().split(':')
                     for k, c in zip(required_col_names, l):
                         job[k] = c.strip()
+
+                    job['grp'] = int(job['grp'])
+                    job['priority'] = int(job['priority'])
+                    job['mem'] = int(job['mem'])
                     tbl.append(job)
 
         ## Modify the jobs and place them in the queue.

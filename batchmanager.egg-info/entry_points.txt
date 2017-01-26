@@ -1,0 +1,4 @@
+[console_scripts]
+batchmanager = batchmanager.batchmanager:main
+batchserver = batchmanager.batchserver:main
+

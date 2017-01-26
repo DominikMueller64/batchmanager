@@ -1,0 +1,24 @@
+Metadata-Version: 1.1
+Name: batchmanager
+Version: 0.0.0
+Summary: A batch process manager.
+Home-page: https://github.com/DominikMueller64/batchmanager
+Author: Dominik Müller 
+Author-email: dominikmueller64@yahoo.de
+License: GPLv3
+Description: * A batch process manager
+        
+        A simple batch process manager based an a server-client model for distributed
+        computing.
+        
+        
+        
+        
+        
+Keywords: distributes computing
+Platform: UNKNOWN
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Scientists
+Classifier: Topic :: Scientific/EngineeringLicense :: OSI Approved :: GNU General Public License v3 (GPLv3)
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6

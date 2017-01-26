@@ -1,0 +1,11 @@
+Pyro4
+cmd2
+shortuuid
+psutil
+click
+
+[dev]
+check-manifest
+
+[test]
+coverage
