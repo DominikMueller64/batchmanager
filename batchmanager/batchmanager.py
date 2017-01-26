@@ -17,98 +17,86 @@ import pandas
 import operator
 import pickle
 
-# Global variables.
+from .functions import *
+from .globvar import *
 
-required_col_names = 'grp priority prefix script args mem'.split()
-job_keys = required_col_names.copy()
-job_keys.insert(0, 'id')
-Job = collections.namedtuple('Job', job_keys)
+# module_logger = logging.getLogger('batchmanager')
+# module_logger.setLevel(logging.DEBUG)
+# # Create handlers.
+# stream_handler = logging.StreamHandler()
+# file_handler = logging.FileHandler(filename='batchmanager.log', mode='w')
+# # level = logging.INFO
+# level = logging.DEBUG
+# stream_handler.setLevel(level)
+# file_handler.setLevel(level)
 
-# Auxiliary function.
-def dict_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
+# # Create formatter.
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
+# # Add formatter to handlers.
+# stream_handler.setFormatter(formatter)
+# file_handler.setFormatter(formatter)
 
-def format_date(date):
-    return date.strftime('%Y-%m-%d %H:%M:%S')
-
-def convert_size(size, ndigits=2):
-   if (size == 0):
-       return '0B'
-   size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
-   i = int(math.floor(math.log(size, 1024)))
-   p = math.pow(1024, i)
-   s = round(size/p, ndigits)
-   return '%s%s' % (s, size_name[i])
-
-def set_password():
-    os.environ["SSHPASS"] = input('Password: ').strip()
-
-def print_table(table):
-    """Print a table"""
-    logger = logging.getLogger('module_logger.print_table')
-    col_width = [max(len(str(x)) for x in col) for col in zip(*table)]
-    for line in table:
-        print(" | ".join("{:{}}".format(x, col_width[i])
-                         for i, x in enumerate(line)))
-
-# def convert_poll(poll):
-#     lkup = {0: 'finished'}
-#     if poll is None:
-#         return 'running'
-#     else:
-#         try:
-#             msg = lkup[poll]
-#         except KeyError:
-#             raise RuntimeError('Conversion of poll {} failed.'.format(poll))
-#         else:
-#             return msg
+# # Add handler to logger.
+# module_logger.addHandler(stream_handler)
+# module_logger.addHandler(file_handler)
 
 
-def trim_path(path, level):
-    path = list(pathlib.Path(path).parts)
-    # del path[0]  ## likely a bug
-    return os.path.join(*path[-level:])
+# Logging.
+module_logger = logging.getLogger(__name__)
+module_logger.info('Start logging.')
 
-module_logger = logging.getLogger('batchmanager')
-module_logger.setLevel(logging.DEBUG)
+# class Job:
+#     def __init__(self, **kwargs):
+#         self.__dict__.update(kwargs)
 
-# Create handlers.
-stream_handler = logging.StreamHandler()
-file_handler = logging.FileHandler(filename='batchmanager.log', mode='w')
-# level = logging.INFO
-level = logging.DEBUG
-stream_handler.setLevel(level)
-file_handler.setLevel(level)
 
-# Create formatter.
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+## from http://stackoverflow.com/questions/3462566/python-elegant-way-to-deal-with-lock-on-a-variable
+## This wraps a variable together with its lock into a class.
+class LockedVariable(object):
+    def __init__(self, value, lock=None):
+        self._value = value
+        self._lock = lock if lock else threading.RLock()
+        self._locked = False
 
-# Add formatter to handlers.
-stream_handler.setFormatter(formatter)
-file_handler.setFormatter(formatter)
+    @property
+    def locked(self):
+        return self._locked
 
-# Add handler to logger.
-module_logger.addHandler(stream_handler)
-module_logger.addHandler(file_handler)
+    def assign(self, value):
+        with self:
+            self._value = value
+
+    def release():
+        self._locked = False
+        return self._lock.release()
+
+    def __enter__(self):
+        self._lock.__enter__()
+        self._locked = True
+        return self._value
+
+    def __exit__(self, *args, **kwargs):
+        if self._locked:
+            self._locked = False
+            return self._lock.__exit__(*args, **kwargs)
+
+
 
 class launcher(threading.Thread):
+
     def __init__(self, manager, max_cycles, sleep_cycles):
         super().__init__(group=None, target=None, name='launcher', daemon=True)
 
         self.manager = manager
         self.max_cycles = max_cycles
-        self.cycle = 1
         self.sleep_cycles = sleep_cycles
         self.can_run = threading.Event()
-        self.can_run.set()  # On default, the launcher can run once started.
         self.should_stop = threading.Event()
-        self.logger = logging.getLogger('batchmanager.launcher')
+        self.logger = logging.getLogger(__name__ + '.launcher')
 
-        self.logger.debug('launcher initialized.')
+        self.cycle = 1
+        self.can_run.set()  # On default, the launcher can run once started.
 
     def status(self):
         table = list()
@@ -129,24 +117,24 @@ class launcher(threading.Thread):
 
     def pause(self):
         self.logger.info('Pausing.')
-        print('Pausing launcher')
+        print('Pausing launcher.')
         self.can_run.clear()
 
     def resume(self):
-        self.logger.debug('Resuming.')
-        print('Resuming launcher')
+        self.logger.info('Resuming.')
+        print('Resuming launcher.')
         self.can_run.set()
 
     def stop(self):
-        self.logger.debug('Stopping.')
-        print('Stopping launcher')
+        self.logger.info('Stopping.')
+        print('Stopping launcher.')
         self.should_stop.set()
 
     def get_avail_server(self, mem):
         self.logger.debug('Getting server.')
         with self.manager.server_lock:
             servers = self.manager.servers
-            ids = {i for i, s in servers.items() if s.available(mem * 1024)}
+            ids = {i for i, s in servers.items() if s.is_available(mem * 1024)}
             if not ids:
                 self.logger.debug('No server available.')
                 return  # No server satisfies the requirements.
@@ -170,106 +158,127 @@ class launcher(threading.Thread):
                         continue
                     with self.manager.queue_lock:
                         job = self.manager.queue.popleft()
-                        server = self.get_avail_server(job.mem)
+                        server = self.get_avail_server(job['mem'])
                         if server is None:
                             self.manager.queue.appendleft(job)  # Add job back.
                             continue  # No server satisfies the requirements.
-                        server.proc_start(job)
+                        server.start_proc(job)
 
 class manager(Cmd):
 
-    ## This is problematic if no name server is used.
-    # @classmethod
-    # def do_objects(cls, args):
-    #     with Pyro4.naming.locateNS() as ns:
-    #         table = list()
-    #         header = ('name', 'uri (uniform resource identifier)')
-    #         table.append(header)
-    #         for name, uri in ns.list().items():
-    #             if name == 'Pyro.NameServer':
-    #                 continue
-    #             table.append((name, uri))
-    #     print_table(table)
 
     def __init__(self):
         super(manager, self).__init__()
-        self._servers = dict()
-        self._queue = collections.deque()
-        self.logger = logging.getLogger('batchmanager.manager')
+        self.servers = dict()
+        self.queue = collections.deque()
         self.server_lock = threading.RLock()  # Lock for server dictionary.
         self.queue_lock = threading.RLock()  # Lock for the job queue.
         self.launcher = None  # Here comes the launcher once started.
 
-    @property
-    def servers(self):
-        return self._servers
+        self.logger = logging.getLogger(__name__ + '.manager')
 
-    @property
-    def queue(self):
-        return self._queue
+        self.config_items = {'sleep_cycles': {
+                                'type': float,
+                                'min': 1
+                            },'max_cycles': {
+                                'type': int,
+                                'min': 1
+                            }}
+
 
     ## Controlling of launcher.
 
-    def do_start_launcher(self, args):
+    def do_start(self, args):
         self.launcher = launcher(manager=self, max_cycles=int(1e6), sleep_cycles=5)
         self.launcher.start()
 
-    def do_pause_launcher(self, args):
+    def do_pause(self, args):
         self.launcher.pause()
 
-    def do_resume_launcher(self, args):
+    def do_resume(self, args):
         self.launcher.resume()
 
-    def do_stop_launcher(self, args):
+    def do_stop(self, args):
         self.launcher.stop()
 
-    def do_launcher_status(self, args):
+    def do_launcher(self, args):
         try:
             self.launcher.status()
         except AttributeError:
             print('Launcher has not yet been started.')
 
-    def do_set_sleep_cycles(self, value):
-        value = value.split()[0]
+
+    ## Configuration of launcher.
+    def config_parser(self, value):
+        return value.split()[0]
+
+    def config_launcher(self, value, items):
+        value = self.config_parser(value)
         try:
-            value = float(value)
+            value = items['type'](value)
         except ValueError as err:
-            msg = 'Could not set sleep_cycles to {}.'.format(value)
+            msg = 'Could not set to {}.'.format(value)
             self.logger.warning(msg)
             warnings.warn(msg)
         else:
-            if value < 1:
-                msg = 'sleep_length must be at least 1 second!'
+            if value < items['min']:
+                msg = 'Must be at least {}!'.format(items['min'])
                 self.logger.warning(msg)
                 warnings.warn(msg)
                 return
 
             self.launcher.sleep_cycles = value
-            msg = 'Set sleep_cycles to {} seconds.'.format(value)
+            msg = 'Set to {}.'.format(value)
             self.logger.info(msg)
             print(msg)
+
+    def do_set_sleep_cycles(self, value):
+        self.config_launcher(value, self.config_items['sleep_cycles'])
 
     def do_set_max_cycles(self, value):
-        try:
-            value = int(float(value))
-        except ValueError as err:
-            msg = 'Could not set max_cycles to {}.'.format(value)
-            self.logger.warning(msg)
-            warnings.warn(msg)
-        else:
-            if value < self.launcher.cycle:
-                msg = 'max_cycles must be larger than the current cycle.'
-                self.logger.warning(msg)
-                warnings.warn(msg)
-                return
+        self.config_launcher(value, self.config_items['max_cycles'])
 
-            msg = 'Set max_cycles to {}.'.format(value)
-            self.launcher.max_cycles = value
-            self.logger.info(msg)
-            print(msg)
+    # def do_set_sleep_cycles(self, value):
+    #     value = value.split()[0]
+    #     try:
+    #         value = float(value)
+    #     except ValueError as err:
+    #         msg = 'Could not set to {}.'.format(value)
+    #         self.logger.warning(msg)
+    #         warnings.warn(msg)
+    #     else:
+    #         if value < 1:
+    #             msg = 'Must be at least 1 second!'
+    #             self.logger.warning(msg)
+    #             warnings.warn(msg)
+    #             return
 
+    #         self.launcher.sleep_cycles = value
+    #         msg = 'Set to {} seconds.'.format(value)
+    #         self.logger.info(msg)
+    #         print(msg)
 
-    ## Controlling server.
+    # def do_set_max_cycles(self, value):
+    #     try:
+    #         value = int(float(value))
+    #     except ValueError as err:
+    #         msg = 'Could not set to {}.'.format(value)
+    #         self.logger.warning(msg)
+    #         warnings.warn(msg)
+    #     else:
+    #         if value < self.launcher.cycle:
+    #             msg = 'Must be larger than the current cycle.'
+    #             self.logger.warning(msg)
+    #             warnings.warn(msg)
+    #             return
+
+    #         msg = 'Set to {}.'.format(value)
+    #         self.launcher.max_cycles = value
+    #         self.logger.info(msg)
+    #         print(msg)
+
+    ## Controlling of server.
+
     @options([make_option('-K', '--key', default=None, type='str',
                           help='the HMAC key to use'),
 
@@ -288,9 +297,8 @@ class manager(Cmd):
 
     def do_add_server(self, args, opts=None):
         """Add server to the manager."""
-        logger = logging.getLogger('batchmanager.manager.add_server')
         args = args.strip().split()
-        ct = 0
+        ct = itertools.count()
         for name in args:
             uri = name
             # TODO: Find out how to integrate context manager here.
@@ -304,7 +312,7 @@ class manager(Cmd):
                 except Pyro4.errors.NamingError as err:
                     msg = ('Failed to locate the nameserver. '
                         'Did you set the correct HMAC key?')
-                    logger.exception(msg)
+                    self.logger.exception(msg)
                     continue
 
                 # Try to lookup the uri on the name server.
@@ -312,7 +320,7 @@ class manager(Cmd):
                     uri = ns.lookup(name)
                 except Pyro4.errors.NamingError as err:
                     msg = ('Name {} not found on the nameserver.'.format(name))
-                    logger.exception(msg)
+                    self.logger.exception(msg)
                     continue
 
             # Try to obtain a proxy.
@@ -320,7 +328,7 @@ class manager(Cmd):
                 server = Pyro4.Proxy(uri)
             except Pyro4.errors.PyroError as err:
                 msg = ('{} is an invalid uri.'.format(name))
-                logger.exception(msg)
+                self.logger.exception(msg)
                 continue
             else:
                 server._pyroHmacKey = opts.key
@@ -330,135 +338,88 @@ class manager(Cmd):
                 server._pyroBind()
             except Pyro4.errors.CommunicationError:
                 msg = ('HMAC keys do not match.')
-                logger.exception(msg)
+                self.logger.exception(msg)
                 continue
             else:
                 with self.server_lock:
                     self.servers[server.id] = server
-                ct += 1
+                next(ct)
 
-        logger.info('Added {} server.'.format(ct))
+        self.logger.info('Added {} server.'.format(ct))
 
-    def get_server_id(self, name):
+    def get_server_id_by_name(self, name):
         """Get the id of a server from its (unique!) name."""
-        logger = logging.getLogger('batchmanager.manager.get_server_id')
+        # with self.server_lock:
+            # servers = list(self.servers.values())
+            # names = tuple(server.name for server in servers)
+            # if name not in names:
+            #     msg = 'Server {} not found.'.format(name)
+            #     self.logger.warning(msg)
+            #     warnings.warn(msg, RuntimeWarning)
+            # else:
+            #     server = servers[names.index(name)]
+            #     return server.id
         with self.server_lock:
-            servers = list(self.servers.values())
-            names = tuple(server.name for server in servers)
-            if name not in names:
-                msg = 'Server {} not found.'.format(name)
-                logger.warning(msg)
-                warnings.warn(msg, RuntimeWarning)
+            for server in self.servers.values():
+                if server.name == names:
+                    return server.id
+
+        msg = 'Server {} not found.'.format(name)
+        self.logger.warning(msg)
+        warnings.warn(msg, RuntimeWarning)
+
+
+    def get_server_by_process_id(self, id):
+        with self.server_lock:
+            for server in self.servers.values():
+                if id in server.get_proc_ids():
+                    return server
+
+        msg = 'Process id: {} could not be found.'.format(id)
+        self.logger.warning(msg)
+        warnings.warn(msg, RuntimeWarning)
+
+    def apply_to_server(self, what, args, opts):
+        with self.server_lock:
+            if opts.all:
+                args = (server.name for server in self.servers.values())
             else:
-                server = servers[names.index(name)]
-                return server.id
+                args = args.strip().split()
+            ct = itertools.count()
+            for name in args:
+                id = self.get_server_id_by_name(name)
+                if id is not None:
+                    if what == 'shutdown':
+                        self.servers[id].shutdown(opts.terminate)
+                        del self.servers[id]
+                    elif what == 'remove':
+                        del self.servers[id]
+                    elif what == 'clear':
+                        self.servers[id].clear_proc()
+                    next(ct)
+        return next(ct)
 
     @options([make_option('-A', '--all', action='store_true', help='shutdown all servers'),
               make_option('-T', '--terminate', action='store_true', help='terminate processes')])
     def do_shutdown_server(self, args, opts=None):
-        logger = logging.getLogger('batchmanager.manager.shutdown_server')
-        with self.server_lock:
-            if opts.all:
-                for server in self.servers.values():
-                    server.shutdown(opts.terminate)
-                self.servers.clear()
-                logger.info('Shutdown all servers.')
-                return
-
-            args = args.strip().split()
-            ct = 0
-            for name in args:
-                id = self.get_server_id(name)
-                if id is not None:
-                    try:
-                        self.servers[id].shutdown(opts.terminate)
-                        del self.servers[id]
-                    except KeyError as err:
-                        # This indicates a programming error.
-                        raise RuntimeError('Bug: Server {} could not be removed!'.format(name))
-                    else:
-                        ct += 1
-
-        logger.info('Shutdown {} server.'.format(ct))
+        """Shutdown servers."""
+        ct = self.apply_to_server(self, what='shutdown', args=args, opts=opts)
+        self.logger.info('Shutdown {} server(s).'.format(ct))
 
     @options([make_option('-A', '--all', action='store_true', help='remove all servers')])
     def do_remove_server(self, args, opts=None):
         """Remove servers from the manager."""
-        logger = logging.getLogger('batchmanager.manager.remove_server')
-        with self.server_lock:
-            if opts.all:
-                self.servers.clear()
-                logger.info('Removed all servers.')
-                return
+        ct = self.apply_to_server(self, what='remove', args=args, opts=opts)
+        self.logger.info('Removed {} server(s).'.format(ct))
 
-            args = args.strip().split()
-            ct = 0
-            for name in args:
-                id = self.get_server_id(name)
-                if id is not None:
-                    try:
-                        del self.servers[id]
-                    except KeyError as err:
-                        raise RuntimeError('Bug: Server {} could not be removed!'.format(name))
-                    else:
-                        ct += 1
-
-        logger.info('Removed {} server.'.format(ct))
-
-    @options([make_option('-A', '--all', action='store_true', help='remove all servers')])
+    @options([make_option('-A', '--all', action='store_true', help='clear all servers')])
     def do_clear_server(self, args, opts=None):
         """Clear servers from process that are not running."""
-        logger = logging.getLogger('batchmanager.manager.clear_server')
-        with self.server_lock:
-            if opts.all:
-                for server in self.servers.values():
-                    server.clear()
-                logger.info('Cleared all servers.')
-                return
+        ct = self.apply_to_server(self, what='clear', args=args, opts=opts)
+        self.logger.info('Cleared {} server(s).'.format(ct))
 
-            args = args.strip().split()
-            ct = 0
-            for name in args:
-                id = self.get_server_id(name)
-                if id is not None:
-                    self.servers[id].clear()
-                    ct += 1
 
-        logger.info('Removed {} server.'.format(ct))
-
-    def server_by_process_id(self, id):
-        logger = logging.getLogger('batchmanager.manager.server_by_process_id')
-        with self.server_lock:
-            for server in self.servers.values():
-                if id in server.proc_ids():
-                    return server
-
-        msg = 'Process id: {} could not be found.'.format(id)
-        logger.warning(msg)
-        warnings.warn(msg, RuntimeWarning)
-
-    @options([make_option('-A', '--all', action='store_true', help='terminate all processes')])
-    def do_terminate_proc(self, args, opts=None):
-        logger = logging.getLogger('batchmanager.manager.do_terminate_processes')
-        with self.server_lock:
-            if opts.all:
-                for server in self.servers.values():
-                    for id in server.proc_ids():
-                        server.proc_terminate(id)
-            else:
-                ids = args.split()
-                for id in ids:
-                    server = self.server_by_process_id(id)
-                    if server is not None:
-                        server.proc_terminate(id)
-                    # try:
-                    #     server = self.server_by_process_id(id)
-                    # except RuntimeWarning as err:
-                    #     raise
-                    # else:
-                    #     server.proc_terminate(id)
-
-    def do_server_status(self, args):
+    def do_server(self, args):
         table = list()
         header = ('pid', 'name', 'id', 'host', 'start', 'cpu', 'proc',
                   'load (1, 5, 15 min.)',
@@ -472,13 +433,60 @@ class manager(Cmd):
                 host = str(server.ip)
                 start = str(server.start_fmt)
                 cpu = str(server.cpu_count)
-                proc = str(server.num_proc(status='running'))
+                proc = str(server.get_num_proc(status='running'))
                 load = ', '.join(str(_) for _ in server.load_average())
                 mem = server.virtual_memory()
                 mem = ', '.join((convert_size(mem[0]), convert_size(mem[1]), str(mem[2]) + '%'))
                 table.append((pid, name, id, host, start, cpu, proc, load, mem))
 
         print_table(table)
+
+
+    # Controlling of processes.
+    def get_server_from_proc_id(self, id):
+        for server in self.servers.values():
+            for i in server.proc_ids():
+                if i == id:
+                    return server
+                    break
+            else:
+                continue
+            break
+        else:
+            msg = 'Server could not be found from process id.'
+            self.logger.warn(msg)
+            warnings.warn(msg)
+
+    def do_stdout(self, id):
+        server = self.get_server_from_proc_id(id)
+        if server:
+            print(server.get_proc_stdout(id))
+
+
+    # TODO There is much room for improvement.
+    # - Terminate all processes.
+    # - Terminate all processes of a specific set of servers.
+    # - Terminate all processes of a set of process ids.
+    @options([make_option('-A', '--all', action='store_true', help='terminate all processes')])
+    def do_terminate_proc(self, args, opts=None):
+        with self.server_lock:
+            if opts.all:
+                for server in self.servers.values():
+                    for id in server.get_proc_ids():
+                        server.terminate_proc(id)
+            else:
+                ids = args.split()
+                for id in ids:
+                    server = self.get_server_by_process_id(id)
+                    if server is not None:
+                        server.terminate_proc(id)
+                    # try:
+                    #     server = self.get_server_by_process_id(id)
+                    # except RuntimeWarning as err:
+                    #     raise
+                    # else:
+                    #     server.proc_terminate(id)
+
 
     @options([make_option('-T', '--type', type='str',
                           default='sqlite3', nargs=1,
@@ -511,11 +519,9 @@ class manager(Cmd):
                     self.queue.extend(jobs)
                     return
 
-
-        with self.queue_lock:
-            self.queue.extend(jobs)
-
-
+        ## TODO: I have no idea where these two line come froma / belong to.
+        # with self.queue_lock:
+        #     self.queue.extend(jobs)
         if opts.type == 'sqlite3':
             import sqlite3
             try:
@@ -559,6 +565,7 @@ class manager(Cmd):
                         job[k] = c.strip()
                     tbl.append(job)
 
+        ## Modify the jobs and place them in the queue.
         ct = itertools.count()
         with self.queue_lock:
             for job in tbl:
@@ -584,7 +591,7 @@ class manager(Cmd):
                 job['args'] = job['args'].split()
                 job['id'] = shortuuid.uuid()
 
-                job = Job(**job)  # Convert to namedtuple
+                # job = Job(**job)  # Make Job instance.
                 self.queue.append(job)
                 next(ct)
 
@@ -596,7 +603,7 @@ class manager(Cmd):
                           default=2, nargs=1, help='depth of paths'),
               make_option('-S', '--short',  action='store_true',
                           help='abbreviate the exposition')])
-    def do_proc_status(self, args, opts=None):
+    def do_proc(self, args, opts=None):
         table = list()
         if opts.short:
             header = ('pid', 'script', 'args', 'status')
@@ -608,33 +615,31 @@ class manager(Cmd):
         with self.server_lock:
             for server in self.servers.values():
                 ip = server.ip
-                for id in server.proc_ids():
-                    job = server.proc_job(id)
-                    status = server.proc_status(id)
-                    start = server.proc_start_date(id, format=True)
-                    pid = server.proc_pid(id)
-                    script = trim_path(job.script, opts.level)
-                    args = ' '.join(job.args)
+                for id in server.get_proc_ids():
+                    job = server.get_proc_job(id)
+                    status = server.get_proc_status(id)
+                    start = server.get_proc_start_date(id, format=True)
+                    pid = server.get_proc_pid(id)
+                    script = trim_path(job['script'], opts.level)
+                    args = ' '.join(job['args'])
 
                     if opts.short:
                         tmp = tuple(map(str, (pid, script, args, status)))
                     else:
                         tmp = (str(_) for _ in (pid,
-                                                job.grp,
-                                                job.priority,
+                                                job['grp'],
+                                                job['priority'],
                                                 id,
                                                 ip,
-                                                job.prefix,
+                                                job['prefix'],
                                                 script,
                                                 args,
-                                                job.mem,
+                                                job['mem'],
                                                 start,
                                                 status))
                     table.append(list(tmp))
 
         print_table(table)
-
-
 
 
     @options([make_option('-L', '--level', type='int',
@@ -649,13 +654,13 @@ class manager(Cmd):
         table.append(header)
         with self.queue_lock:
             for job in self.queue:
-                tmp = (str(_) for _ in (job.id,
-                                        job.grp,
-                                        job.priority,
-                                        ' '.join(job.prefix),
-                                        trim_path(job.script, opts.level),
-                                        ' '.join(job.args),
-                                        job.mem))
+                tmp = (str(_) for _ in (job['id'],
+                                        job['grp'],
+                                        job['priority'],
+                                        ' '.join(job['prefix']),
+                                        trim_path(job['script'], opts.level),
+                                        ' '.join(job['args']),
+                                        job['mem']))
                 table.append(list(tmp))
 
         n = opts.n
@@ -675,14 +680,16 @@ class manager(Cmd):
             self.launcher.status()  # See if launcher really stopped.
 
         if self.queue:
-            ans = input('There are still {} jobs enqueued. '.format(len(self.queue)) +
-                        'Store them on hard disk for later usage? [y/n]: ')
+
+            while True:
+                ans = input('There are still {} jobs enqueued. '.format(len(self.queue)) +
+                            'Store them on hard disk for later usage? [y/n]: ')
+                if ans in ('y', 'n'):
+                    break
 
             if ans == 'y':
-                # string = pickle.dumps(self.queue)
                 timestamp = time.strftime('%Y-%m-%d_%H:%M:%S')
                 path = os.path.join('.', 'dumped_jobs_' + timestamp)
-
                 with open(file=path, mode='wb') as f:
                     pickle.dump(self.queue, f)
 
@@ -695,6 +702,7 @@ class manager(Cmd):
 
 
 def main():
+    # Pyro4.config.SERIALIZER = 'pickle'
     man = manager()
     man.prompt = '> '
     man.colors = True
@@ -714,3 +722,16 @@ if __name__ == '__main__':
 # print(cmdlist)
 # subprocess.Popen(cmdlist)
 
+
+    ## This is problematic if no name server is used.
+    # @classmethod
+    # def do_objects(cls, args):
+    #     with Pyro4.naming.locateNS() as ns:
+    #         table = list()
+    #         header = ('name', 'uri (uniform resource identifier)')
+    #         table.append(header)
+    #         for name, uri in ns.list().items():
+    #             if name == 'Pyro.NameServer':
+    #                 continue
+    #             table.append((name, uri))
+    #     print_table(table)

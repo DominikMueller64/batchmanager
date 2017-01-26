@@ -14,14 +14,36 @@ import time
 import signal
 import threading
 import click
+import io
+import collections
 
-def get_date():
-    return datetime.datetime.now()
+from .functions import *
+from .globvar import *
 
-def format_date(date):
-    return date.strftime('%Y-%m-%d %H:%M:%S')
+# Logging.
+module_logger = logging.getLogger(__name__)
+module_logger.info('Start logging.')
 
-class process:
+
+class async_reader(threading.Thread):
+
+    def __init__(self, stream):
+        super().__init__(group=None, target=None, name='async_reader', daemon=True)
+        self.stream = stream
+        self.buffer = io.StringIO()
+
+    def run(self):
+        for line in iter(self.stream.readline, ''):
+            self.buffer.write(line)
+
+    @classmethod
+    def new(cls, stream):
+        reader = cls(stream)
+        reader.start()
+        return reader
+
+
+class Process:
 
     states = ('running', 'finished', 'terminated', 'killed', 'aborted')
 
@@ -30,60 +52,42 @@ class process:
              signal.SIGTERM.value: 'terminated',
              signal.SIGKILL.value: 'killed'}
 
-    update_interval = 1  # Interval of updating the process.
+    update_interval = 1  # Interval of updating the process (seconds).
+
+    @classmethod
+    # constructor
+    def from_job(cls, job):
+        prefix = job['prefix']
+        script = job['script']
+        args = job['args']
+        cmdlist = [*prefix, script, *args]
+
+        try:
+            proc = subprocess.Popen(args=cmdlist,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+
+        except (FileNotFoundError, NotADirectoryError) as err:
+            pass
+        else:
+            process = cls(proc=proc, job=job)
+            return process
 
     def __init__(self, proc, job):
-        self._pid = os.getpid()
-        self._start = get_date()
-        self._start_fmt = format_date(self._start)
-        self._host_name = socket.gethostname()
-        self._ip = Pyro4.socketutil.getIpAddress(None, workaround127=True)
-        self._id = job.id 
-        self._proc = proc
-        self._job = job
-        self._status = None
+        self.pid = os.getpid()
+        self.start = get_date()
+        self.start_fmt = format_date(self.start)
+        self.host_name = socket.gethostname()
+        self.ip = Pyro4.socketutil.getIpAddress(None, workaround127=True)
+        self.id = job['id']
+        self.proc = proc
+        self.job = job
+        self.status = None
 
         self.start_updater()  # Start the updater thread upon initialization.
+        self.stdout_reader = async_reader.new(io.TextIOWrapper(proc.stdout, encoding='utf-8'))
+        self.stderr_reader = async_reader.new(io.TextIOWrapper(proc.stderr, encoding='utf-8'))
 
-    @property
-    def pid(self):
-        return self._pid
-
-    @property
-    def start(self):
-        return self._start
-
-    @property
-    def start_fmt(self):
-        return self._start_fmt
-
-    @property
-    def host_name(self):
-        return self._host_name
-
-    @property
-    def ip(self):
-        return self._ip
-
-    @property
-    def id(self):
-        return self._id
-
-    @property
-    def proc(self):
-        return self._proc
-
-    @property
-    def job(self):
-        return self._job
-
-    @property
-    def status(self):
-        return self._status
-
-    @status.setter
-    def status(self, value):
-        self._status = value
 
     # The status can take on: 'running', 'finished', 'terminated', 'failed'
     def updater(self):
@@ -99,6 +103,12 @@ class process:
                                   target=self.updater,
                                   daemon=True)
         thread.start()
+
+    def read_stdout(self):
+        return self.stdout_reader.buffer.getvalue()
+
+    def read_stderr(self):
+        return self.stderr_reader.buffer.getvalue()
 
 
 @Pyro4.expose
@@ -126,40 +136,118 @@ class server:
         self._host_name = host,
         self._max_proc = max_proc
         self._max_load = max_load
-        self.ns = ns
-        self.daemon = daemon
+        self._ns = ns
+        self._daemon = daemon
 
         self._processes = dict()
         self._pid = os.getpid()
         self._start = get_date()
-        self._start_fmt = format_date(self._start)
+        self._start_fmt = format_date(self.start)
         self._cpu_count = multiprocessing.cpu_count()
         self._ip = socket.gethostbyname(daemon.uriFor('myserver').host)  # Not perfect solution.
         self._id = shortuuid.uuid()
 
-        self.lock = threading.RLock()
+        self._lock = threading.RLock()
 
-        # Set up logging.
-        self.logger = logging.getLogger('.'.join(('server', name)))
-        self.logger.setLevel(logging.DEBUG)
-        # Create handlers.
-        stream_handler = logging.StreamHandler()
-        file_handler = logging.FileHandler(filename='log', mode='w')
-        level = logging.DEBUG
-        stream_handler.setLevel(level)
-        file_handler.setLevel(level)
-        # Create formatter.
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        # Add formatter to handlers.
-        stream_handler.setFormatter(formatter)
-        file_handler.setFormatter(formatter)
-        # Add handler to logger.
-        self.logger.addHandler(stream_handler)
-        self.logger.addHandler(file_handler)
+        self.logger = logging.getLogger(__name__ + '.batchserver')
 
+    def is_available(self, mem):
+        if (self.load() < self.max_load and
+            float(self.avail_mem()) > mem and
+            self.get_num_proc(status='running') < self.max_proc):
+            return True
+        return False
+
+    def get_start_date(self, format=False):
+        date = self.start
+        if format:
+            return format_date(date)
+        return date
+
+    def clear_proc(self):
+        ids = set()
+        for id, process in self.processes.items():
+            if process.status not in (None, 'running'):
+                ids.add(id)
+        for id in ids:
+            del self.processes[id]
+
+    def get_num_proc(self, status='running'):
+        if status not in Process.states:
+            raise ValueError("'status' must be one of {}.".format(
+                              ', '.join(Process.states)))
+
+        states = tuple(p.status for p in self.processes.values())
+        return states.count(status)
+
+    def start_proc(self, job):
+        fun_name = inspect.currentframe().f_code.co_name
+        logger = logging.getLogger('.'.join((self.logger.name, fun_name)))
+
+        process = Process.from_job(job)
+        self.processes[process.id] = process  # Register newly launched process.
+        return process.id  # Return process id for the caller (batchmanager).
+
+    def get_proc_ids(self):
+        return tuple(p.id for p in self.processes.values())
+
+    def get_proc(self, id):
+        try:
+            process = self.processes[id]
+        except KeyError:
+            warnings.warn('Process not found.', RuntimeWarning)
+        else:
+            return process
+
+    def get_proc_stdout(self, id):
+        return self.get_proc(id).read_stdout()
+
+    def get_proc_stderr(self, id):
+        return self.get_proc(id).read_stderr()
+
+    def get_proc_job(self, id):
+        return self.get_proc(id).job
+
+    def get_proc_start_date(self, id, format=False):
+        if format:
+            return self.get_proc(id).start_fmt
+        return self.get_proc(id).start
+
+    def get_proc_pid(self, id):
+        return self.get_proc(id).proc.pid
+
+    def get_proc_status(self, id):
+        return self.get_proc(id).status
+
+    def terminate_proc(self, id):
+        self.get_proc(id).proc.terminate()
+
+    def kill_proc(self, id):
+        self.get_proc(id).proc.kill()
+
+    def delete_proc(self, id):
+        if self.get_proc(id).proc.poll() is None:
+            warnings.warn('Process is still running.', RuntimeWarning)
+        else:
+            del self.processes[id]
+
+    @Pyro4.oneway   # in case call returns much later than daemon.shutdown
+    def shutdown(self, terminate_processes=True):
+        if terminate_processes:
+            for proc in self.processes:
+                proc.terminate()
+        if self.ns:
+            self.ns.remove(self.name)
+        self.daemon.shutdown()
+
+    # Properties are necessary for Pyro communication.
     @property
     def name(self):
         return self._name
+
+    @property
+    def host_name(self):
+        return self._host_name
 
     @property
     def max_proc(self):
@@ -168,6 +256,15 @@ class server:
     @property
     def max_load(self):
         return self._max_load
+
+    @property
+    def ns(self):
+        return self._ns
+
+    @property
+    def daemon(self):
+        return self._daemon
+
 
     @property
     def processes(self):
@@ -190,10 +287,6 @@ class server:
         return self._cpu_count
 
     @property
-    def host_name(self):
-        return self._host_name
-
-    @property
     def ip(self):
         return self._ip
 
@@ -201,110 +294,9 @@ class server:
     def id(self):
         return self._id
 
-    def available(self, mem):
-        if (self.load() < self.max_load and
-            self.avail_mem() > mem and
-            self.num_proc(status='running') < self.max_proc):
-            return True
-        return False
-
-    def start_date(self, format=False):
-        date = self.start
-        if format:
-            return format_date(date)
-        return date
-
-    def clear(self):
-        ids = set()
-        for id, p in self.processes.items():
-            if p.status not in (None, 'running'):
-                ids.add(id)
-        for id in ids:
-            del self.processes[id]
-
-    def num_proc(self, status='running'):
-        if status not in process.states:
-            raise ValueError("'status' must be one of {}.".format(
-                              ', '.join(process.states)))
-
-        states = tuple(p.status for p in self.processes.values())
-        return states.count(status)
-
-    def proc_start(self, job):
-        fun_name = inspect.currentframe().f_code.co_name
-        logger = logging.getLogger('.'.join((self.logger.name, fun_name)))
-
-        prefix = job.prefix
-        script = job.script
-        args = job.args
-        cmdlist = [*prefix, script, *args]
-
-        # cmdlist = ['Rscript', '--vanilla', './R_test.R', 'adf']
-        # proc = subprocess.Popen(args=cmdlist,
-        #                         stdout=subprocess.PIPE,
-        #                         stderr=subprocess.PIPE)
-        # print(proc.poll())
-        # stdout, stderr = proc.communicate()
-        # print(stdout.decode('utf-8'))
-        # print(stderr.decode('utf-8'))
-
-        try:
-            proc = subprocess.Popen(args=cmdlist,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
-
-        except (FileNotFoundError, NotADirectoryError) as err:
-            logger.exception('File not found.')
-        else:
-            p = process(proc=proc, job=job)
-            self.processes[p.id] = p
-            return p.id
-
-    def proc_ids(self):
-        return tuple(p.id for p in self.processes.values())
-
-    def get_proc(self, id):
-        try:
-            p = self.processes[id]
-        except KeyError:
-            warnings.warn('Process not found.', RuntimeWarning)
-        else:
-            return p
-
-    def proc_job(self, id):
-        return self.get_proc(id).job
-
-    def proc_start_date(self, id, format=False):
-        if format:
-            return self.get_proc(id).start_fmt
-        return self.get_proc(id).start
-
-    def proc_pid(self, id):
-        return self.get_proc(id).proc.pid
-
-    def proc_status(self, id):
-        return self.get_proc(id).status
-
-    def proc_terminate(self, id):
-        self.get_proc(id).proc.terminate()
-
-    def proc_kill(self, id):
-        self.get_proc(id).proc.kill()
-
-    def proc_delete(self, id):
-        if self.get_proc(id).proc.poll() is None:
-            warnings.warn('Process is still running.', RuntimeWarning)
-        else:
-            del self.processes[id]
-
-    @Pyro4.oneway   # in case call returns much later than daemon.shutdown
-    def shutdown(self, terminate_processes=True):
-        if terminate_processes:
-            for proc in self.processes:
-                proc.terminate()
-        if self.ns:
-            self.ns.remove(self.name)
-        self.daemon.shutdown()
+    @property
+    def lock(self):
+        return self._lock
 
 @click.command()
 @click.option('-N', '--name', default=socket.gethostname(), type=str,
@@ -364,6 +356,7 @@ def main(name, host, port, max_proc, max_load, ns, nshost, nsport, key):
     When a server is started, it automatically registers itself in
     the nameserver and can be retrieved and accessed by the manager from there.
     """
+    # Pyro4.config.SERIALIZERS_ACCEPTED.add('dill')  # Accept pickle as incoming serialization format.
     with Pyro4.Daemon(host=host, port=port) as daemon:
         daemon._pyroHmacKey = key
         myserver = server(name=name, host=host,
