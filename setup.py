@@ -10,7 +10,7 @@ with open(path.join(here, 'README.rst'), encoding='utf-8') as f:
     long_description = f.read()
 
 setup(
-    name='batch-manager',
+    name='batchmanager',
 
     # https://packaging.python.org/en/latest/single_source_version.html
     version='0.0.0',
@@ -19,7 +19,7 @@ setup(
     long_description=long_description,
 
     # The project's main homepage.
-    url='https://github.com/DominikMueller64/batch-manager',
+    url='https://github.com/DominikMueller64/batchmanager',
 
     # Author details
     author='Dominik Müller ',
