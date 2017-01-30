@@ -599,7 +599,7 @@ class manager(Cmd):
                     job = server.get_proc_job(id)
                     status = server.get_proc_status(id)
                     start = server.get_proc_start_date(id)
-                    runtime = server.get_proc_runtim(id)
+                    runtime = server.get_proc_runtime(id)
                     pid = server.get_proc_pid(id)
                     script = trim_path(job['script'], opts.level)
                     args = ' '.join(job['args'])
