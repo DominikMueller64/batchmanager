@@ -3,11 +3,14 @@ import datetime
 import os
 import pathlib
 import logging
+import string
+import hashlib
+import base64
+import cryptography.fernet
+# from cryptography.fernet import Fernet
 
 # Logging.
 module_logger = logging.getLogger(__name__)
-
-# Auxiliary functions.
 
 def get_date():
     return datetime.datetime.now()
@@ -20,6 +23,19 @@ def dict_factory(cursor, row):
 
 def format_date(date):
     return date.strftime('%Y-%m-%d %H:%M:%S')
+
+def strfdelta(tdelta, fmt):
+
+    class DeltaTemplate(string.Template):
+        delimiter = "%"
+
+    d = dict()
+    sec = abs(int(tdelta.total_seconds()))
+    d['D'], sec = divmod(sec, 86400)
+    d['H'], sec = divmod(sec, 3600)
+    d['M'], d['S'] = divmod(sec, 60)
+    template = DeltaTemplate(fmt)
+    return template.substitute(**d)
 
 def convert_size(size, ndigits=2):
    if (size == 0):
@@ -45,3 +61,26 @@ def trim_path(path, level):
     path = list(pathlib.Path(path).parts)
     # del path[0]  ## likely a bug
     return os.path.join(*path[-level:])
+
+def get_hmac_key(pw, salt):
+    if pw is None:
+        return pw
+    bpw = pw.encode('utf-8')
+    key = hashlib.pbkdf2_hmac(hash_name='sha256', password=bpw,
+                              salt=salt, iterations=100000)
+    return base64.urlsafe_b64encode(key)
+
+def encrypt_msg(msg, key):
+    cipher_suite = cryptography.fernet.Fernet(key)
+    # Serialize the python object using pickle.
+    msg = pickle.dumps(msg)
+    # Encrypt the message based on the generated key.
+    return cipher_suite.encrypt(msg)
+
+def decrypt_msg(msg, key):
+    cipher_suite = cryptography.fernet.Fernet(key)
+    # Decipher the encrypted message and deserialize it.
+    msg = cipher_suite.decrypt(msg)
+    return pickle.loads(msg)
+
+

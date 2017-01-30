@@ -16,6 +16,7 @@ import itertools
 import pandas
 import operator
 import pickle
+import click
 
 from .functions import *
 from .globvar import *
@@ -166,7 +167,6 @@ class launcher(threading.Thread):
 
 class manager(Cmd):
 
-
     def __init__(self):
         super(manager, self).__init__()
         self.servers = dict()
@@ -185,9 +185,7 @@ class manager(Cmd):
                                 'min': 1
                             }}
 
-
     ## Controlling of launcher.
-
     def do_start(self, args):
         self.launcher = launcher(manager=self, max_cycles=int(1e6), sleep_cycles=5)
         self.launcher.start()
@@ -238,49 +236,9 @@ class manager(Cmd):
     def do_set_max_cycles(self, value):
         self.config_launcher(value, self.config_items['max_cycles'])
 
-    # def do_set_sleep_cycles(self, value):
-    #     value = value.split()[0]
-    #     try:
-    #         value = float(value)
-    #     except ValueError as err:
-    #         msg = 'Could not set to {}.'.format(value)
-    #         self.logger.warning(msg)
-    #         warnings.warn(msg)
-    #     else:
-    #         if value < 1:
-    #             msg = 'Must be at least 1 second!'
-    #             self.logger.warning(msg)
-    #             warnings.warn(msg)
-    #             return
-
-    #         self.launcher.sleep_cycles = value
-    #         msg = 'Set to {} seconds.'.format(value)
-    #         self.logger.info(msg)
-    #         print(msg)
-
-    # def do_set_max_cycles(self, value):
-    #     try:
-    #         value = int(float(value))
-    #     except ValueError as err:
-    #         msg = 'Could not set to {}.'.format(value)
-    #         self.logger.warning(msg)
-    #         warnings.warn(msg)
-    #     else:
-    #         if value < self.launcher.cycle:
-    #             msg = 'Must be larger than the current cycle.'
-    #             self.logger.warning(msg)
-    #             warnings.warn(msg)
-    #             return
-
-    #         msg = 'Set to {}.'.format(value)
-    #         self.launcher.max_cycles = value
-    #         self.logger.info(msg)
-    #         print(msg)
-
     ## Controlling of server.
-
-    @options([make_option('-K', '--key', default=None, type='str',
-                          help='the HMAC key to use'),
+    @options([make_option('-P', '--pw', default=None, type='str',
+                          help='password for secure communication'),
 
               make_option('--ns', action='store_true',
                           help='Enable contacting a name server.'),
@@ -297,18 +255,20 @@ class manager(Cmd):
 
     def do_add_server(self, args, opts=None):
         """Add server to the manager."""
+        key = get_hmac_key(opts.pw, salt)
+        print(key)
         args = args.strip().split()
         ct = itertools.count()
         for name in args:
             uri = name
             # TODO: Find out how to integrate context manager here.
-            # with Pyro4.locateNS(hmac_key=opts.key) as ns:
+            # with Pyro4.locateNS(hmac_key=key) as ns:
             # server = Pyro4.Proxy(':'.join(('PYRONAME', str(name))))
             if opts.ns:
                 # Try to contact the name server.
                 try:
                     ns = Pyro4.locateNS(host=host, port=port,
-                                        broadcast=True, hmac_key=opts.key)
+                                        broadcast=True, hmac_key=key)
                 except Pyro4.errors.NamingError as err:
                     msg = ('Failed to locate the nameserver. '
                         'Did you set the correct HMAC key?')
@@ -331,7 +291,7 @@ class manager(Cmd):
                 self.logger.exception(msg)
                 continue
             else:
-                server._pyroHmacKey = opts.key
+                server._pyroHmacKey = key
 
             # Try to bind to the proxy.
             try:
@@ -421,7 +381,7 @@ class manager(Cmd):
 
     def do_server(self, args):
         table = list()
-        header = ('pid', 'name', 'id', 'host', 'start', 'cpu', 'proc',
+        header = ('pid', 'name', 'id', 'host', 'start', 'runtime', 'cpu', 'proc',
                   'load (1, 5, 15 min.)',
                   'mem (total, avail., used)')
         table.append(header)
@@ -431,13 +391,14 @@ class manager(Cmd):
                 name = str(server.name)
                 id = str(server.id)
                 host = str(server.ip)
-                start = str(server.start_fmt)
+                start = server.get_start_date()
+                runtime = server.get_runtime()
                 cpu = str(server.cpu_count)
                 proc = str(server.get_num_proc(status='running'))
                 load = ', '.join(str(_) for _ in server.load_average())
                 mem = server.virtual_memory()
                 mem = ', '.join((convert_size(mem[0]), convert_size(mem[1]), str(mem[2]) + '%'))
-                table.append((pid, name, id, host, start, cpu, proc, load, mem))
+                table.append((pid, name, id, host, start, runtime, cpu, proc, load, mem))
 
         print_table(table)
 
@@ -445,7 +406,7 @@ class manager(Cmd):
     # Controlling of processes.
     def get_server_from_proc_id(self, id):
         for server in self.servers.values():
-            for i in server.proc_ids():
+            for i in server.get_proc_ids():
                 if i == id:
                     return server
                     break
@@ -458,10 +419,24 @@ class manager(Cmd):
             warnings.warn(msg)
 
     def do_stdout(self, id):
+        id = str(id)  # Conversion to a standard string is explicitly needed.
+        self._print_out(id, 'stdout')
+
+    def do_stderr(self, id):
+        id = str(id)  # Conversion to a standard string is explicitly needed.
+        self._print_out(id, 'stderr')
+
+    def _print_out(self, id, which):
+        if which not in ('stdout', 'stderr'):
+            raise ValueError
         server = self.get_server_from_proc_id(id)
         if server:
-            print(server.get_proc_stdout(id))
-
+            if which == 'stdout':
+                out = server.get_proc_stdout(id)
+            elif which == 'stderr':
+                out = server.get_proc_stderr(id)
+            for line in out:
+                print(line)
 
     # TODO There is much room for improvement.
     # - Terminate all processes.
@@ -487,6 +462,10 @@ class manager(Cmd):
                     # else:
                     #     server.proc_terminate(id)
 
+    def do_clear_jobs(self, args):
+        """Clear all jobs from the queue."""
+        with self.queue_lock:
+            self.queue.clear()
 
     @options([make_option('-T', '--type', type='str',
                           default='sqlite3', nargs=1,
@@ -519,13 +498,10 @@ class manager(Cmd):
                     self.queue.extend(jobs)
                     return
 
-        ## TODO: I have no idea where these two line come froma / belong to.
-        # with self.queue_lock:
-        #     self.queue.extend(jobs)
         if opts.type == 'sqlite3':
             import sqlite3
             try:
-            # conn = sqlite3.connect(db_path, timeout=5, isolation_level='EXCLUSIVE')
+                # conn = sqlite3.connect(db_path, timeout=5, isolation_level='EXCLUSIVE')
                 with sqlite3.connect(db_path, timeout=5, isolation_level='EXCLUSIVE') as conn:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
@@ -603,17 +579,17 @@ class manager(Cmd):
               'The last one is:\n{}.'.format(str(job)))
 
 
-    @options([make_option('-L', '--level', type='int',
-                          default=2, nargs=1, help='depth of paths'),
-              make_option('-S', '--short',  action='store_true',
-                          help='abbreviate the exposition')])
+    @options([make_option('-l', '--level', type='int',
+                          default=2, nargs=1, help='set depth of paths'),
+              make_option('-e', '--extended',  action='store_true',
+                          help='show extended output')])
     def do_proc(self, args, opts=None):
         table = list()
-        if opts.short:
-            header = ('pid', 'script', 'args', 'status')
-        else:
+        if opts.extended:
             header = ('pid', 'grp', 'priority', 'id', 'ip', 'prefix', 'script', 'args',
-                      'mem (MB)', 'start', 'status')
+                      'mem (MB)', 'start', 'runtime', 'status')
+        else:
+            header = ('pid', 'script', 'args', 'runtime' 'status')
         table.append(header)
 
         with self.server_lock:
@@ -622,14 +598,13 @@ class manager(Cmd):
                 for id in server.get_proc_ids():
                     job = server.get_proc_job(id)
                     status = server.get_proc_status(id)
-                    start = server.get_proc_start_date(id, format=True)
+                    start = server.get_proc_start_date(id)
+                    runtime = server.get_proc_runtim(id)
                     pid = server.get_proc_pid(id)
                     script = trim_path(job['script'], opts.level)
                     args = ' '.join(job['args'])
 
-                    if opts.short:
-                        tmp = tuple(map(str, (pid, script, args, status)))
-                    else:
+                    if opts.extended:
                         tmp = (str(_) for _ in (pid,
                                                 job['grp'],
                                                 job['priority'],
@@ -640,7 +615,11 @@ class manager(Cmd):
                                                 args,
                                                 job['mem'],
                                                 start,
-                                                status))
+                                                runtime,
+                                                status,
+                                                ))
+                    else:
+                        tmp = tuple(map(str, (pid, script, args, runtime, status,)))
                     table.append(list(tmp))
 
         print_table(table)
@@ -687,16 +666,18 @@ class manager(Cmd):
 
             while True:
                 ans = input('There are still {} jobs enqueued. '.format(len(self.queue)) +
-                            'Store them on hard disk for later usage? [y/n]: ')
-                if ans in ('y', 'n'):
+                            'Store them on hard disk for later usage? [y/n/c]: ')
+                if ans in ('y', 'n', 'c'):
                     break
 
-            if ans == 'y':
+            if ans == 'c':
+                return
+
+            elif ans == 'y':
                 timestamp = time.strftime('%Y-%m-%d_%H:%M:%S')
                 path = os.path.join('.', 'dumped_jobs_' + timestamp)
                 with open(file=path, mode='wb') as f:
                     pickle.dump(self.queue, f)
-
                 print('Extant jobs were dumped to: ' + path)
 
         return self._STOP_AND_EXIT  # Send stop signal to cmd2
@@ -705,37 +686,40 @@ class manager(Cmd):
     do_exit = do_quit
 
 
+# @click.command()
+# @click.option('-P', '--pw', default=None, type=click.STRING,
+#               help='password for secure communication')
+# def main(pw):
 def main():
-    # Pyro4.config.SERIALIZER = 'pickle'
+    # import argparse
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument('--pw', action='store',
+    #                     dest='pw',
+    #                     help='password for secure communication')
+    # results = parser.parse_args()
+    # print(results)
+    # pw = results.pw
+    # key = get_hmac_key(pw, salt)
+    # del pw
+    # man = manager(key)
     man = manager()
     man.prompt = '> '
     man.colors = True
     man.cmdloop()
 
+## This is never executed, as the entry point is main.
 if __name__ == '__main__':
     main()
 
-# # This is the ip of localhost.
-# server_ip = Pyro4.socketutil.getIpAddress(None, workaround127=True)
-
-# cmd = 'ls'
-
-# # cmd = 'cd ~/Dropbox/Python_Projects/pyro-daemon/pyro-daemon; python server.py blablacar &'
-# cmdlist = ['sshpass', '-e', 'ssh', '-o StrictHostKeyChecking=no',
-#            '@'.join((user, server_ip)), cmd]
-# print(cmdlist)
-# subprocess.Popen(cmdlist)
-
-
-    ## This is problematic if no name server is used.
-    # @classmethod
-    # def do_objects(cls, args):
-    #     with Pyro4.naming.locateNS() as ns:
-    #         table = list()
-    #         header = ('name', 'uri (uniform resource identifier)')
-    #         table.append(header)
-    #         for name, uri in ns.list().items():
-    #             if name == 'Pyro.NameServer':
-    #                 continue
-    #             table.append((name, uri))
-    #     print_table(table)
+## This is problematic if no name server is used.
+# @classmethod
+# def do_objects(cls, args):
+#     with Pyro4.naming.locateNS() as ns:
+#         table = list()
+#         header = ('name', 'uri (uniform resource identifier)')
+#         table.append(header)
+#         for name, uri in ns.list().items():
+#             if name == 'Pyro.NameServer':
+#                 continue
+#             table.append((name, uri))
+#     print_table(table)

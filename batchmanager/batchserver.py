@@ -16,6 +16,8 @@ import threading
 import click
 import io
 import collections
+import queue
+import pickle
 
 from .functions import *
 from .globvar import *
@@ -24,26 +26,65 @@ from .globvar import *
 module_logger = logging.getLogger(__name__)
 module_logger.info('Start logging.')
 
+# ## Code for testing async_reader
+# proc = subprocess.Popen(['ls', '-ahl'],
+#                         universal_newlines=True,
+#                         bufsize=1,
+#                         stdout=subprocess.PIPE
+#                         )
+# print(proc.stdout.closed)
+# r = async_reader.new(proc.stdout)
+# print(proc.stdout.closed)
+# print(r.list())
+# print(r.isAlive())
+
 
 class async_reader(threading.Thread):
 
-    def __init__(self, stream):
+    def __init__(self, stream, queue):
         super().__init__(group=None, target=None, name='async_reader', daemon=True)
         self.stream = stream
-        self.buffer = io.StringIO()
+        self.queue = queue
 
     def run(self):
-        for line in iter(self.stream.readline, ''):
-            self.buffer.write(line)
+        ## See for more discussion:
+        ## http://stackoverflow.com/questions/38181494/what-is-the-difference-
+        ## between-using-universal-newlines-true-with-bufsize-1-an
+        with self.stream as stream:  # Closes the stream automatically.
+            ## Maybe this is necessary, but I don't understand the difference:
+            ## It does not stop the thread when universal_newlines=True and bufsize=1 !
+            # for line in iter(self.stream.readline, b''): 
+            for line in stream:
+                self.queue.put(line.strip())  # Strip whitespace.
+
+    def list(self):
+        with self.queue.mutex:
+            return list(self.queue.queue)
+
+        # # Potentially obsolete solution by Raymond Hettinger:
+        # # http://stackoverflow.com/questions/8196254/iterating-queue-queue-items
+        # mycopy = []
+        # while True:
+        #     try:
+        #         elem = q.get(block=False)
+        #     except queue.Empty:
+        #         break
+        #     else:
+        #         mycopy.append(elem)
+        # for elem in mycopy:
+        #     q.put(elem)
+        # return mycopy
 
     @classmethod
-    def new(cls, stream):
-        reader = cls(stream)
-        reader.start()
-        return reader
+    def new(cls, stream, start=True):
+        q = queue.Queue()
+        r = cls(stream, q)
+        if start:
+            r.start()
+        return r
 
 
-class Process:
+class Process(threading.Thread):
 
     states = ('running', 'finished', 'terminated', 'killed', 'aborted')
 
@@ -54,8 +95,52 @@ class Process:
 
     update_interval = 1  # Interval of updating the process (seconds).
 
+
+    def __init__(self, proc, job):
+        super().__init__(group=None, target=None, name='thread-updater', daemon=True)
+
+        self.pid = os.getpid()
+        self.start_date = get_date()
+        self.host_name = socket.gethostname()
+        self.ip = Pyro4.socketutil.getIpAddress(None, workaround127=True)
+        self.id = job['id']
+        self.proc = proc
+        self.job = job
+        self.status = None
+        self.runtime = None
+
+        # Start threads.
+        self.start()
+        self.stdout_reader = async_reader.new(proc.stdout)
+        self.stderr_reader = async_reader.new(proc.stderr)
+        ## If universal_newlines=False, wrapping with io.TextIOWrapper is required:
+        # self.stdout_reader = async_reader.new(io.TextIOWrapper(proc.stdout, encoding='utf-8'))
+        # self.stderr_reader = async_reader.new(io.TextIOWrapper(proc.stderr, encoding='utf-8'))
+
+    def get_start_date(self):
+        return format_date(self.start_date)
+
+    def get_runtime(self):
+        return strfdelta(get_date() - self.start_date, "%D:%H:%M:%S")
+
+    def get_stdout(self):
+        return self.stdout_reader.list()
+
+    def get_stderr(self):
+        return self.stderr_reader.list()
+
+    # The status can take on: 'running', 'finished', 'terminated', 'failed'
+    # def updater(self):
+    def run(self):
+        while True:
+            self.runtime = strfdelta(get_date() - self.start_date, "%D:%H:%M:%S")
+            poll = self.proc.poll()
+            self.status = self.table.get(poll, 'aborted')  # Aborted if not found.
+            if poll is not None:
+                break  # If not running, die!
+            time.sleep(self.update_interval)
+
     @classmethod
-    # constructor
     def from_job(cls, job):
         prefix = job['prefix']
         script = job['script']
@@ -64,51 +149,20 @@ class Process:
 
         try:
             proc = subprocess.Popen(args=cmdlist,
+                                    # line-buffered mode (flush on newline):
+                                    bufsize=1,
+                                    # Use locale.getpreferredencoding(False) character
+                                    # encoding to decode bytes:
+                                    universal_newlines=True,
                                     stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
 
         except (FileNotFoundError, NotADirectoryError) as err:
+            # TODO: Add proper error handling.
             pass
         else:
             process = cls(proc=proc, job=job)
             return process
-
-    def __init__(self, proc, job):
-        self.pid = os.getpid()
-        self.start = get_date()
-        self.start_fmt = format_date(self.start)
-        self.host_name = socket.gethostname()
-        self.ip = Pyro4.socketutil.getIpAddress(None, workaround127=True)
-        self.id = job['id']
-        self.proc = proc
-        self.job = job
-        self.status = None
-
-        self.start_updater()  # Start the updater thread upon initialization.
-        self.stdout_reader = async_reader.new(io.TextIOWrapper(proc.stdout, encoding='utf-8'))
-        self.stderr_reader = async_reader.new(io.TextIOWrapper(proc.stderr, encoding='utf-8'))
-
-
-    # The status can take on: 'running', 'finished', 'terminated', 'failed'
-    def updater(self):
-        while True:
-            poll = self.proc.poll()
-            self.status = self.table.get(poll, 'aborted')  # Aborted if not found.
-            if poll is not None:
-                break  # If not running, die!
-            time.sleep(self.update_interval)
-
-    def start_updater(self):
-        thread = threading.Thread(name='thread-updater',
-                                  target=self.updater,
-                                  daemon=True)
-        thread.start()
-
-    def read_stdout(self):
-        return self.stdout_reader.buffer.getvalue()
-
-    def read_stderr(self):
-        return self.stderr_reader.buffer.getvalue()
 
 
 @Pyro4.expose
@@ -141,10 +195,10 @@ class server:
 
         self._processes = dict()
         self._pid = os.getpid()
-        self._start = get_date()
-        self._start_fmt = format_date(self.start)
+        self._start_date = get_date()
+        # self._start_fmt = format_date(self.start)
         self._cpu_count = multiprocessing.cpu_count()
-        self._ip = socket.gethostbyname(daemon.uriFor('myserver').host)  # Not perfect solution.
+        self._ip = socket.gethostbyname(daemon.uriFor('batchserver').host)  # Not perfect solution.
         self._id = shortuuid.uuid()
 
         self._lock = threading.RLock()
@@ -158,11 +212,11 @@ class server:
             return True
         return False
 
-    def get_start_date(self, format=False):
-        date = self.start
-        if format:
-            return format_date(date)
-        return date
+    def get_start_date(self):
+        return format_date(self.start_date)
+
+    def get_runtime(self):
+        return strfdelta(get_date() - self.start_date, "%D:%H:%M:%S")
 
     def clear_proc(self):
         ids = set()
@@ -199,19 +253,20 @@ class server:
         else:
             return process
 
+    def get_proc_runtime(self, id):
+        return self.get_proc(id).get_runtime()
+
     def get_proc_stdout(self, id):
-        return self.get_proc(id).read_stdout()
+        return self.get_proc(id).get_stdout()
 
     def get_proc_stderr(self, id):
-        return self.get_proc(id).read_stderr()
+        return self.get_proc(id).get_stderr()
 
     def get_proc_job(self, id):
         return self.get_proc(id).job
 
-    def get_proc_start_date(self, id, format=False):
-        if format:
-            return self.get_proc(id).start_fmt
-        return self.get_proc(id).start
+    def get_proc_start_date(self, id):
+        return format_date(self.get_proc(id).start_date)
 
     def get_proc_pid(self, id):
         return self.get_proc(id).proc.pid
@@ -265,7 +320,6 @@ class server:
     def daemon(self):
         return self._daemon
 
-
     @property
     def processes(self):
         return self._processes
@@ -279,8 +333,8 @@ class server:
         return self._start
 
     @property
-    def start_fmt(self):
-        return self._start_fmt
+    def start_date(self):
+        return self._start_date
 
     @property
     def cpu_count(self):
@@ -308,6 +362,7 @@ class server:
               type=click.STRING,
               help='hostname or ip address to bind the batchserver on. '
               'default: hostname of this machine.')
+
 @click.option('-P', '--port', default=0, type=click.INT,
               help='port to bind the batchserver on. '
                    'default: a random port.')
@@ -322,8 +377,8 @@ class server:
               help='maximum load allowed '
                    '(default: number of detected cpu on this machine.)')
 
-@click.option('-K', '--key', default=None, type=click.STRING,
-              help='the HMAC key to use.')
+@click.option('--pw', default=None, type=click.STRING,
+              help='password for secure communication')
 
 @click.option('--ns/--no-ns', default=False,
               help='Enable/disable contacting a name server. '
@@ -340,7 +395,7 @@ class server:
                 '- host parameter given: the port now means the actual name server port. '
                 '- host parameter not given: the port now means the broadcast port.)')
 
-def main(name, host, port, max_proc, max_load, ns, nshost, nsport, key):
+def main(name, host, port, max_proc, max_load, pw, ns, nshost, nsport):
     """Start a server process.\n
     A server process serves as a handle for the batch process manager and runs
     on an individual server in the network.
@@ -357,14 +412,17 @@ def main(name, host, port, max_proc, max_load, ns, nshost, nsport, key):
     the nameserver and can be retrieved and accessed by the manager from there.
     """
     # Pyro4.config.SERIALIZERS_ACCEPTED.add('dill')  # Accept pickle as incoming serialization format.
+    key = get_hmac_key(pw, salt)
+    del pw
+    print(key)
     with Pyro4.Daemon(host=host, port=port) as daemon:
         daemon._pyroHmacKey = key
-        myserver = server(name=name, host=host,
+        batchserver = server(name=name, host=host,
                           max_proc=max_proc, max_load=max_load,
                           ns=None,
                           daemon=daemon)
-        myserver_uri = daemon.register(myserver)
-        uri = daemon.uriFor('myserver')
+        batchserver_uri = daemon.register(batchserver)
+        uri = daemon.uriFor('batchserver')
 
         if ns:
             # Try to register the daemon in a name server.
@@ -372,13 +430,13 @@ def main(name, host, port, max_proc, max_load, ns, nshost, nsport, key):
                 with Pyro4.locateNS(host=nshost, port=nsport,
                                     broadcast=True, hmac_key=key) as ns:
                     try:
-                        ns.register(name, uri=myserver_uri, safe=False)
+                        ns.register(name, uri=batchserver_uri, safe=False)
                     except Pyro4.errors.NamingError as err:
                         print('{} is already registered in the name server, '.format(name) +
                               'use a different one!')
                         raise
                     else:
-                        myserver.ns = ns
+                        batchserver.ns = ns
 
             except ConnectionRefusedError as err:
                 print('Connection to a name server failed. '
@@ -389,8 +447,8 @@ def main(name, host, port, max_proc, max_load, ns, nshost, nsport, key):
         print()
         print('host: {}'.format(uri.host))
         print('port: {}'.format(uri.port))
-        # print('uri: {}'.format(uri.asString()))  # Not the same as myserver_uri!
-        print('uri: {}'.format(myserver_uri))
+        # print('uri: {}'.format(uri.asString()))  # Not the same as batchserver_uri!
+        print('uri: {}'.format(batchserver_uri))
 
         daemon.requestLoop()
 
