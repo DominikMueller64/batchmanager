@@ -6,8 +6,7 @@ import logging
 import string
 import hashlib
 import base64
-import cryptography.fernet
-# from cryptography.fernet import Fernet
+# import cryptography.fernet
 
 # Logging.
 module_logger = logging.getLogger(__name__)
@@ -70,17 +69,17 @@ def get_hmac_key(pw, salt):
                               salt=salt, iterations=100000)
     return base64.urlsafe_b64encode(key)
 
-def encrypt_msg(msg, key):
-    cipher_suite = cryptography.fernet.Fernet(key)
-    # Serialize the python object using pickle.
-    msg = pickle.dumps(msg)
-    # Encrypt the message based on the generated key.
-    return cipher_suite.encrypt(msg)
+# def encrypt_msg(msg, key):
+#     cipher_suite = cryptography.fernet.Fernet(key)
+#     # Serialize the python object using pickle.
+#     msg = pickle.dumps(msg)
+#     # Encrypt the message based on the generated key.
+#     return cipher_suite.encrypt(msg)
 
-def decrypt_msg(msg, key):
-    cipher_suite = cryptography.fernet.Fernet(key)
-    # Decipher the encrypted message and deserialize it.
-    msg = cipher_suite.decrypt(msg)
-    return pickle.loads(msg)
+# def decrypt_msg(msg, key):
+#     cipher_suite = cryptography.fernet.Fernet(key)
+#     # Decipher the encrypted message and deserialize it.
+#     msg = cipher_suite.decrypt(msg)
+#     return pickle.loads(msg)
 
 
