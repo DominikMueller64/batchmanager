@@ -8,6 +8,7 @@ batchmanager/functions.py
 batchmanager/globvar.py
 batchmanager/launcher.py
 batchmanager/test.py
+batchmanager/test_rapid_cycling.py
 batchmanager/test_threading.py
 batchmanager.egg-info/PKG-INFO
 batchmanager.egg-info/SOURCES.txt

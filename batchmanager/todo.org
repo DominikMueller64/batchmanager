@@ -1,0 +1,31 @@
+
+* Fix error with too many open file handles.
+I thought it would be fixed, by it re-appeared. Maybe this is because of the many in-memory streams that I use to keep track of stdout and stderr per process? To reproduce the problem, run batchserver and batchmanager with the jobfile test_rapid_cycling.txt. After some hundred of cycles, the error should pop up.
+
+Investigation:
+I tried to figure out how many open connections/files the batchserver is handling. To do so, you can do lsof -a -p 17124 > conns_delme.txt 2>&1. This will pip all the output to a file, which can then be read and analyzed. The file might show the problem. There a about 1000 of these guys here opened:
+
+COMMAND     PID   USER   FD   TYPE   DEVICE  SIZE/OFF       NODE NAME
+.
+.
+.
+batchserv 17124 domi89 1009r  FIFO      0,8       0t0   20697369 pipe
+batchserv 17124 domi89 1010r  FIFO      0,8       0t0   20697384 pipe
+batchserv 17124 domi89 1011r  FIFO      0,8       0t0   20697378 pipe
+batchserv 17124 domi89 1012r  FIFO      0,8       0t0   20697391 pipe
+batchserv 17124 domi89 1013r  FIFO      0,8       0t0   20697385 pipe
+batchserv 17124 domi89 1014r  FIFO      0,8       0t0   20697398 pipe
+batchserv 17124 domi89 1015r  FIFO      0,8       0t0   20697392 pipe
+batchserv 17124 domi89 1016r  FIFO      0,8       0t0   20697404 pipe
+batchserv 17124 domi89 1017r  FIFO      0,8       0t0   20697399 pipe
+batchserv 17124 domi89 1019r  FIFO      0,8       0t0   20697405 pipe
+
+As the crash occurs after about 500 cycles, and because per process two files are opend for recording stderr and stdout, these number fit nicely together. The word 'FIFO' in the Type column is likely not related to the job queue, but has some different meaning.
+For debugging, I suggest to add an option to (by default) turn off the record keeping of stdout and stderr. If the user wants to keep records for debugging purposes, he should be notified that he either must raise the ulimit of connections, or restrict the number of processes registered in the batchserver.
+
+
+* Add summary of processes
+Add a command to yield a summary of the status of all processes, how many finished, aborted, running etc. Maybe also add a field with the average runtime for the finished processes?
+
+* Add the runtime to the output of proc
+Add a field which shows then a process started or alternative (better) the runtime of the process up to now. A field with the stopping time can also be added. This would be informative about the speed of the processes.

@@ -1,22 +1,24 @@
-import Pyro4
-import os
-import subprocess
-import warnings
-import sys
-import datetime
-from cmd2 import Cmd, options, make_option
-import math
-import shortuuid
-import threading
-import logging
-import time
 import collections
-import pathlib
+import datetime
+import getpass
 import itertools
-import pandas
+import logging
+import math
 import operator
+import os
+import pathlib
 import pickle
+import subprocess
+import sys
+import threading
+import time
+import warnings
+
 import click
+import pandas
+import Pyro4
+import shortuuid
+from cmd2 import Cmd, make_option, options
 
 from .functions import *
 from .globvar import *
@@ -44,6 +46,16 @@ from .globvar import *
 
 
 # Logging.
+
+LEVELS = {
+    'nolog' : logging.CRITICAL + 1,
+    'debug': logging.DEBUG,
+    'info': logging.INFO,
+    'warning': logging.WARNING,
+    'error': logging.ERROR,
+    'critical': logging.CRITICAL,
+}
+
 module_logger = logging.getLogger(__name__)
 module_logger.info('Start logging.')
 
@@ -86,12 +98,12 @@ class LockedVariable(object):
 
 class launcher(threading.Thread):
 
-    def __init__(self, manager, max_cycles, sleep_cycles):
+    def __init__(self, manager, max, sleep):
         super().__init__(group=None, target=None, name='launcher', daemon=True)
 
         self.manager = manager
-        self.max_cycles = max_cycles
-        self.sleep_cycles = sleep_cycles
+        self.max = max
+        self.sleep = sleep
         self.can_run = threading.Event()
         self.should_stop = threading.Event()
         self.logger = logging.getLogger(__name__ + '.launcher')
@@ -101,7 +113,7 @@ class launcher(threading.Thread):
 
     def status(self):
         table = list()
-        header = ('name', 'status', 'cycle', 'max_cycles', 'sleep_cycles')
+        header = ('name', 'status', 'cycle', 'max', 'sleep')
         table.append(header)
 
         if not self.is_alive():
@@ -113,7 +125,7 @@ class launcher(threading.Thread):
         else:
             stat = 'paused'
 
-        table.append((self.name, stat, self.cycle, self.max_cycles, self.sleep_cycles))
+        table.append((self.name, stat, self.cycle, self.max, self.sleep))
         print_table(table)
 
     def pause(self):
@@ -146,8 +158,8 @@ class launcher(threading.Thread):
     def run(self):
         self.logger.debug('Starting.')
         print('Starting launcher.')
-        while self.cycle <= self.max_cycles:
-            if self.should_stop.wait(self.sleep_cycles):
+        while self.cycle <= self.max:
+            if self.should_stop.wait(self.sleep):
                 break
 
             if self.can_run.is_set():
@@ -163,54 +175,104 @@ class launcher(threading.Thread):
                         if server is None:
                             self.manager.queue.appendleft(job)  # Add job back.
                             continue  # No server satisfies the requirements.
-                        server.start_proc(job)
+                        encr_job = encrypt_msg(job, self.manager.key)
+                        # self.logger.info('The job is {}'.format(encr_job))
+                        server.start_proc(encr_job)
 
 class manager(Cmd):
 
     def __init__(self):
         super(manager, self).__init__()
+        self.allow_cli_args = False  # This is vital for allowing to use argparse or click!
+
         self.servers = dict()
         self.queue = collections.deque()
         self.server_lock = threading.RLock()  # Lock for server dictionary.
         self.queue_lock = threading.RLock()  # Lock for the job queue.
         self.launcher = None  # Here comes the launcher once started.
+        self.key = None
 
         self.logger = logging.getLogger(__name__ + '.manager')
 
-        self.config_items = {'sleep_cycles': {
+        self.config_items = {'sleep': {
                                 'type': float,
-                                'min': 1
-                            },'max_cycles': {
+                                'min': 1.0
+                            },'max': {
                                 'type': int,
                                 'min': 1
                             }}
 
     ## Controlling of launcher.
-    def do_start(self, args):
-        self.launcher = launcher(manager=self, max_cycles=int(1e6), sleep_cycles=5)
+    @options([
+        make_option('-s', '--sleep', type="int", default=5, help="Sleeping time between cycles in seconds (default=5)."),
+        make_option('-m', '--max', type="int", default=int(1e6), help="Maximum number of cycles (default=1e6)."),
+    ])
+    def do_start(self, args, opts=None):
+        """Start a new process launcher
+
+        The process launcher is a central component of the batchmanager.
+        It runs as a thread in the background an continuously checks if
+        there are processes in the queue and if there are sufficient resources
+        to start them. If there are not enough resources, no process is started.
+
+        The choice on which server a process is started depends on two criteria:
+        (i) the expected memory required by the process (given by the user) and
+        (ii) the load average. A process can only be started on a server if
+        there is sufficient memory available. Among
+        the servers that satisfy this condition, the one with the smallest 1
+        minute load average is selected.
+
+        To save resources, the launcher only wakes up occasionally and checks if a
+        process can be started. The launcher only wakes up for a limited number of
+        cycles to prevent running indefinitely. The sleep length and maximum number of
+        cycles can be specified when the launcher is started. After it is started, they
+        can be altered via "set_sleep" and "set_max".
+        """
+        self.launcher = launcher(manager=self, max=opts.max, sleep=opts.sleep)
         self.launcher.start()
 
+    @options([])
     def do_pause(self, args):
+        """Pause the launcher
+
+        The launcher pauses and no new processes are started (no new cycles are entered).
+        The launcher can be resumed by the command "resume".
+        """
         self.launcher.pause()
 
+    @options([])
     def do_resume(self, args):
+        """Resume the launcher
+
+        This resumes the launcher after it has been paused.
+        """
         self.launcher.resume()
 
+    @options([])
     def do_stop(self, args):
+        """Stop the launcher
+
+        This stops the launcher.
+        """
         self.launcher.stop()
 
+    @options([])
     def do_launcher(self, args):
+        """Launcher status
+
+        Show the status of the launcher.
+        """
         try:
             self.launcher.status()
         except AttributeError:
             print('Launcher has not yet been started.')
 
-
     ## Configuration of launcher.
     def config_parser(self, value):
         return value.split()[0]
 
-    def config_launcher(self, value, items):
+    def config_launcher(self, value, what):
+        items = self.config_items[what]
         value = self.config_parser(value)
         try:
             value = items['type'](value)
@@ -225,63 +287,64 @@ class manager(Cmd):
                 warnings.warn(msg)
                 return
 
-            self.launcher.sleep_cycles = value
+            setattr(self.launcher, what, value)
             msg = 'Set to {}.'.format(value)
             self.logger.info(msg)
             print(msg)
 
-    def do_set_sleep_cycles(self, value):
-        self.config_launcher(value, self.config_items['sleep_cycles'])
+    def do_set_sleep(self, value):
+        self.config_launcher(value, 'sleep')
 
-    def do_set_max_cycles(self, value):
-        self.config_launcher(value, self.config_items['max_cycles'])
+    def do_set_max(self, value):
+        self.config_launcher(value, 'max')
 
     ## Controlling of server.
-    @options([make_option('-P', '--pw', default=None, type='str',
-                          help='password for secure communication'),
+    @options([])
+        # [make_option('-P', '--pw', default=None, type='str',
+        #                   help='password for secure communication'),
 
-              make_option('--ns', action='store_true',
-                          help='Enable contacting a name server.'),
+        #  make_option('--ns', action='store_true',
+        #              help='Enable contacting a name server.'),
 
-              make_option('--nshost', default=None, type='str',
-                          help='hostname or ip address of the name server in the network '
-                          '(default: None. A network broadcast lookup is used.)'),
+        #  make_option('--nshost', default=None, type='str',
+        #              help='hostname or ip address of the name server in the network '
+        #              '(default: None. A network broadcast lookup is used.)'),
 
-              make_option('--nsport', default=None, type='int',
-                          help='the port number on which the name server is running. '
-                          '(default: None. The exact meaning depends on whether the host parameter is given: '
-                          '- host parameter given: the port now means the actual name server port. '
-                          '- host parameter not given: the port now means the broadcast port.)')])
+        #  make_option('--nsport', default=None, type='int',
+        #              help='the port number on which the name server is running. '
+        #              '(default: None. The exact meaning depends on whether the host parameter is given: '
+        #              '- host parameter given: the port now means the actual name server port. '
+        #              '- host parameter not given: the port now means the broadcast port.)')]
 
     def do_add_server(self, args, opts=None):
         """Add server to the manager."""
-        key = get_hmac_key(opts.pw, salt)
-        print(key)
-        args = args.strip().split()
+        # args = args.strip().split()
         ct = itertools.count()
         for name in args:
             uri = name
+            # self.logger.info('Uri : {}'.format(uri))
             # TODO: Find out how to integrate context manager here.
             # with Pyro4.locateNS(hmac_key=key) as ns:
             # server = Pyro4.Proxy(':'.join(('PYRONAME', str(name))))
-            if opts.ns:
-                # Try to contact the name server.
-                try:
-                    ns = Pyro4.locateNS(host=host, port=port,
-                                        broadcast=True, hmac_key=key)
-                except Pyro4.errors.NamingError as err:
-                    msg = ('Failed to locate the nameserver. '
-                        'Did you set the correct HMAC key?')
-                    self.logger.exception(msg)
-                    continue
 
-                # Try to lookup the uri on the name server.
-                try:
-                    uri = ns.lookup(name)
-                except Pyro4.errors.NamingError as err:
-                    msg = ('Name {} not found on the nameserver.'.format(name))
-                    self.logger.exception(msg)
-                    continue
+            # if opts.ns:
+            #     # Try to contact the name server.
+            #     try:
+            #         ns = Pyro4.locateNS(host=host, port=port,
+            #                             broadcast=True, hmac_key=key)
+            #     except Pyro4.errors.NamingError as err:
+            #         msg = ('Failed to locate the nameserver. '
+            #             'Did you set the correct HMAC key?')
+            #         self.logger.exception(msg)
+            #         continue
+
+            #     # Try to lookup the uri on the name server.
+            #     try:
+            #         uri = ns.lookup(name)
+            #     except Pyro4.errors.NamingError as err:
+            #         msg = ('Name {} not found on the nameserver.'.format(name))
+            #         self.logger.exception(msg)
+            #         continue
 
             # Try to obtain a proxy.
             try:
@@ -291,7 +354,7 @@ class manager(Cmd):
                 self.logger.exception(msg)
                 continue
             else:
-                server._pyroHmacKey = key
+                server._pyroHmacKey = self.key
 
             # Try to bind to the proxy.
             try:
@@ -307,27 +370,90 @@ class manager(Cmd):
 
         self.logger.info('Added {} server.'.format(ct))
 
-    def get_server_id_by_name(self, name):
-        """Get the id of a server from its (unique!) name."""
-        # with self.server_lock:
-            # servers = list(self.servers.values())
-            # names = tuple(server.name for server in servers)
-            # if name not in names:
-            #     msg = 'Server {} not found.'.format(name)
-            #     self.logger.warning(msg)
-            #     warnings.warn(msg, RuntimeWarning)
-            # else:
-            #     server = servers[names.index(name)]
-            #     return server.id
+    # def get_server_id_by_hostname(self, host_name):
+    #     """Get the id of a server from its (unique!) name."""
+    #     # with self.server_lock:
+    #         # servers = list(self.servers.values())
+    #         # names = tuple(server.name for server in servers)
+    #         # if name not in names:
+    #         #     msg = 'Server {} not found.'.format(name)
+    #         #     self.logger.warning(msg)
+    #         #     warnings.warn(msg, RuntimeWarning)
+    #         # else:
+    #         #     server = servers[names.index(name)]
+    #         #     return server.id
+    #     with self.server_lock:
+    #         for server in self.servers.values():
+    #             if server.host_name == host_name:
+    #                 return server.id
+
+    def remove_server(self, identifier, by_id=True):
+        if by_id:
+            return self.remove_server_by_id(identifier)
+        else:
+            return self.remove_server_by_ip(identifier)
+
+    def remove_server_by_id(self, id):
+        with self.server_lock:
+            try:
+                del self.servers[id]
+            except KeyError:
+                msg = 'Server {} not found.'.format(id)
+                self.logger.warning(msg)
+                warnings.warn(msg, RuntimeWarning)
+                return False
+            else:
+                return True
+
+    def remove_server_by_ip(self, ip):
+        with self.server_lock:
+            for key in self.servers.copy():
+                if self.servers[key].ip == ip:
+                    del self.servers[key]
+                    return True
+
+            msg = 'Server {} not found.'.format(ip)
+            self.logger.warning(msg)
+            warnings.warn(msg, RuntimeWarning)
+            return False
+
+    def get_server(self, identifier, by_id=True):
+        if by_id:
+            return self.get_server_by_id(identifier)
+        else:
+            return self.get_server_by_ip(identifier)
+
+    def get_server_by_id(self, id):
+        with self.server_lock:
+            try:
+                server = self.servers[id]
+            except KeyError:
+                msg = 'Server {} not found.'.format(id)
+                self.logger.warning(msg)
+                warnings.warn(msg, RuntimeWarning)
+            else:
+                return server
+
+    def get_server_by_ip(self, ip):
         with self.server_lock:
             for server in self.servers.values():
-                if server.name == names:
-                    return server.id
+                if server.ip == ip:
+                    return server
 
-        msg = 'Server {} not found.'.format(name)
+        msg = 'Server {} not found.'.format(ip)
         self.logger.warning(msg)
         warnings.warn(msg, RuntimeWarning)
 
+    # def get_server_id_by_ip(self, ip):
+    #     """Get the id of a server from its ip."""
+    #     with self.server_lock:
+    #         for server in self.servers.values():
+    #             if server.ip == ip:
+    #                 return server.id
+
+    #     msg = 'Server {} not found.'.format(ip)
+    #     self.logger.warning(msg)
+    #     warnings.warn(msg, RuntimeWarning)
 
     def get_server_by_process_id(self, id):
         with self.server_lock:
@@ -342,63 +468,96 @@ class manager(Cmd):
     def apply_to_server(self, what, args, opts):
         with self.server_lock:
             if opts.all:
-                args = (server.name for server in self.servers.values())
+                args = (server.id for server in self.servers.values())
+                opts.id = True
             else:
                 args = args.strip().split()
+
             ct = itertools.count()
-            for name in args:
-                id = self.get_server_id_by_name(name)
-                if id is not None:
+            for identifier in args:
+                if identifier is not None:
                     if what == 'shutdown':
-                        self.servers[id].shutdown(opts.terminate)
-                        del self.servers[id]
+                        server = self.get_server(identifier, by_id=opts.id)
+                        if server:
+                            server.shutdown(opts.terminate)
+                            self.remove_server(identifier, by_id=opts.id)
+                            next(ct)
                     elif what == 'remove':
-                        del self.servers[id]
+                        if self.remove_server(identifier, by_id=opts.id):
+                            next(ct)
                     elif what == 'clear':
-                        self.servers[id].clear_proc()
-                    next(ct)
+                        server = self.get_server(identifier, by_id=opts.id)
+                        if server:
+                            server.clear_proc()
+                            next(ct)
         return next(ct)
 
     @options([make_option('-A', '--all', action='store_true', help='shutdown all servers'),
-              make_option('-T', '--terminate', action='store_true', help='terminate processes')])
+              make_option('-T', '--terminate', action='store_true', help='terminate processes'),
+              make_option('--id', action='store_true', help='identify server by its id')])
     def do_shutdown_server(self, args, opts=None):
         """Shutdown servers."""
-        ct = self.apply_to_server(self, what='shutdown', args=args, opts=opts)
+        ct = self.apply_to_server(what='shutdown', args=args, opts=opts)
         self.logger.info('Shutdown {} server(s).'.format(ct))
 
-    @options([make_option('-A', '--all', action='store_true', help='remove all servers')])
+    @options([make_option('-A', '--all', action='store_true', help='remove all servers'),
+              make_option('--id', action='store_true', help='identify server by its id')])
     def do_remove_server(self, args, opts=None):
         """Remove servers from the manager."""
-        ct = self.apply_to_server(self, what='remove', args=args, opts=opts)
+        ct = self.apply_to_server(what='remove', args=args, opts=opts)
         self.logger.info('Removed {} server(s).'.format(ct))
 
-    @options([make_option('-A', '--all', action='store_true', help='clear all servers')])
+    @options([make_option('-A', '--all', action='store_true', help='clear all servers'),
+              make_option('--id', action='store_true', help='identify server by its id')])
     def do_clear_server(self, args, opts=None):
         """Clear servers from process that are not running."""
-        ct = self.apply_to_server(self, what='clear', args=args, opts=opts)
+        ct = self.apply_to_server(what='clear', args=args, opts=opts)
         self.logger.info('Cleared {} server(s).'.format(ct))
 
 
     def do_server(self, args):
         table = list()
-        header = ('pid', 'name', 'id', 'host', 'start', 'runtime', 'cpu', 'proc',
-                  'load (1, 5, 15 min.)',
-                  'mem (total, avail., used)')
+        header = ('pid'
+                  ,'id'
+                  ,'host (ip)'
+                  ,'start'
+                  ,'time (d:h:m:s)'
+                  ,'cpu'
+                  ,'proc (r, f, c)'
+                  ,'load (1, 5, 15)'
+                  ,'mem (total, avail., used)'
+        )
         table.append(header)
         with self.server_lock:
             for server in self.servers.values():
-                pid = str(server.pid)
-                name = str(server.name)
-                id = str(server.id)
-                host = str(server.ip)
-                start = server.get_start_date()
-                runtime = server.get_runtime()
-                cpu = str(server.cpu_count)
-                proc = str(server.get_num_proc(status='running'))
+                # pid = server.pid
+                # id = server.id
+                # host = server.ip
+                # start = server.get_start_date()
+                # runtime = server.get_runtime()
+                # cpu = server.cpu_count
+                # proc = server.get_num_proc(status='running')
+                nr = server.get_num_proc(status='running')
+                nf = server.get_num_proc(status='finished')
+                nc = (server.get_num_proc(status='killed') +
+                      server.get_num_proc(status='terminated') +
+                      server.get_num_proc(status='aborted'))
+                proc = ', '.join(str(_) for _ in (nr, nf, nc))
                 load = ', '.join(str(_) for _ in server.load_average())
                 mem = server.virtual_memory()
                 mem = ', '.join((convert_size(mem[0]), convert_size(mem[1]), str(mem[2]) + '%'))
-                table.append((pid, name, id, host, start, runtime, cpu, proc, load, mem))
+                table.append(
+                    (server.pid,
+                     server.id,
+                     server.ip,
+                     server.get_start_date(),
+                     server.get_runtime(),
+                     server.cpu_count,
+                     proc,
+                     load,
+                     mem,
+                    )
+                )
 
         print_table(table)
 
@@ -575,8 +734,8 @@ class manager(Cmd):
                 self.queue.append(job)
                 next(ct)
 
-        print('Read in {} jobs. '.format(next(ct)) +
-              'The last one is:\n{}.'.format(str(job)))
+        print('Read in {} jobs. '.format(next(ct)))
+        # + 'The last one is:\n{}.'.format(str(job)))
 
 
     @options([make_option('-l', '--level', type='int',
@@ -587,9 +746,9 @@ class manager(Cmd):
         table = list()
         if opts.extended:
             header = ('pid', 'grp', 'priority', 'id', 'ip', 'prefix', 'script', 'args',
-                      'mem (MB)', 'start', 'runtime', 'status')
+                      'mem (MB)', 'start', 'time (d:h:m:s)', 'status')
         else:
-            header = ('pid', 'script', 'args', 'runtime' 'status')
+            header = ('pid', 'id', 'script', 'args', 'time (d:h:m:s)', 'status')
         table.append(header)
 
         with self.server_lock:
@@ -597,29 +756,35 @@ class manager(Cmd):
                 ip = server.ip
                 for id in server.get_proc_ids():
                     job = server.get_proc_job(id)
-                    status = server.get_proc_status(id)
-                    start = server.get_proc_start_date(id)
-                    runtime = server.get_proc_runtime(id)
-                    pid = server.get_proc_pid(id)
-                    script = trim_path(job['script'], opts.level)
-                    args = ' '.join(job['args'])
+                    # status = server.get_proc_status(id)
+                    # start = server.get_proc_start_date(id)
+                    # runtime = server.get_proc_runtime(id)
+                    # pid = server.get_proc_pid(id)
+                    # script = trim_path(job['script'], opts.level)
+                    # args = ' '.join(job['args'])
 
                     if opts.extended:
-                        tmp = (str(_) for _ in (pid,
+                        tmp = (str(_) for _ in (server.get_proc_pid(id),
                                                 job['grp'],
                                                 job['priority'],
                                                 id,
                                                 ip,
-                                                job['prefix'],
-                                                script,
-                                                args,
+                                                ' '.join(job['prefix']),
+                                                trim_path(job['script'], opts.level),
+                                                ' '.join(job['args']),
                                                 job['mem'],
-                                                start,
-                                                runtime,
-                                                status,
+                                                server.get_proc_start_date(id),
+                                                server.get_proc_runtime(id),
+                                                server.get_proc_status(id),
                                                 ))
                     else:
-                        tmp = tuple(map(str, (pid, script, args, runtime, status,)))
+                        tmp = tuple(map(str, (server.get_proc_pid(id),
+                                              id,
+                                              trim_path(job['script'], opts.level),
+                                              ' '.join(job['args']),
+                                              server.get_proc_runtime(id),
+                                              server.get_proc_status(id),
+                        )))
                     table.append(list(tmp))
 
         print_table(table)
@@ -685,31 +850,60 @@ class manager(Cmd):
     do_q = do_quit
     do_exit = do_quit
 
+@click.command()
+@click.option('--log/--no-log', default=False, help='enable/disable logging')
+def main(log):
+    """Start a new batchmanager.\n
 
-# @click.command()
-# @click.option('-P', '--pw', default=None, type=click.STRING,
-#               help='password for secure communication')
-# def main(pw):
-def main():
+    A batchmanager manages one to several instances of a batchserver and delegates
+    processes to it.
+
+    To run batch processes, proceed as follows:
+
+    1) Start batchserver processes on all servers that should be employed
+
+    2) Start a batchmanager instance somewhere in the network. The ports on which the
+    batchserver instances run need to be accessible by the batchmanager.
+
+    3) Add the batchservers using the command "add_servers" via their URI.
+
+    4) Add the processes that should run by the command by "add_jobs".
+
+    5) Start the process launcher by the command "launcher".
+
+    The password will be used to secure the communication between the batchserver and
+    the batchmanager. It is necessary that the passwords of all batchservers match
+    with the password of the batchmanager to which they will be connected.
+    """
+
     # import argparse
     # parser = argparse.ArgumentParser()
     # parser.add_argument('--pw', action='store',
     #                     dest='pw',
     #                     help='password for secure communication')
     # results = parser.parse_args()
-    # print(results)
-    # pw = results.pw
-    # key = get_hmac_key(pw, salt)
-    # del pw
-    # man = manager(key)
+
+    level_name = 'debug' if log else 'nolog'
+    level = LEVELS.get(level_name, logging.NOTSET)
+    module_logger.setLevel(level)
+
     man = manager()
     man.prompt = '> '
     man.colors = True
+
+    try:
+        pw = getpass.getpass()
+    except Exception as err:
+        print('ERROR:', err)
+    else:
+        man.key = get_hmac_key(pw, salt)
+        del pw
+
     man.cmdloop()
 
-## This is never executed, as the entry point is main.
-if __name__ == '__main__':
-    main()
+# ## This is never executed, as the entry point is main.
+# if __name__ == '__main__':
+#     main()
 
 ## This is problematic if no name server is used.
 # @classmethod

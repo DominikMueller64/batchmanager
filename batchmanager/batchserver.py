@@ -1,23 +1,26 @@
-import Pyro4
+import collections
+import datetime
+import getpass
+import inspect
+import io
+import logging
+import multiprocessing
+import os
+import pickle
+import queue
+import signal
+import socket
 import subprocess
 import sys
-import logging
-import os
-import datetime
-import psutil
-import multiprocessing
-import warnings
-import socket
-import shortuuid
-import inspect
-import time
-import signal
 import threading
+import time
+import warnings
+import base64
+
 import click
-import io
-import collections
-import queue
-import pickle
+import psutil
+import Pyro4
+import shortuuid
 
 from .functions import *
 from .globvar import *
@@ -53,7 +56,7 @@ class async_reader(threading.Thread):
         with self.stream as stream:  # Closes the stream automatically.
             ## Maybe this is necessary, but I don't understand the difference:
             ## It does not stop the thread when universal_newlines=True and bufsize=1 !
-            # for line in iter(self.stream.readline, b''): 
+            # for line in iter(self.stream.readline, b''):
             for line in stream:
                 self.queue.put(line.strip())  # Strip whitespace.
 
@@ -184,14 +187,16 @@ class server:
     def load(cls):
         return os.getloadavg()[0]
 
-    def __init__(self, name, host, max_proc, max_load, ns, daemon):
+    # def __init__(self, name, host, max_proc, max_load, ns, daemon):
+    def __init__(self, host, max_proc, max_load, daemon, key):
 
-        self._name = name
-        self._host_name = host,
+        # self._name = name
+        self._host_name = host
         self._max_proc = max_proc
         self._max_load = max_load
-        self._ns = ns
+        # self._ns = ns
         self._daemon = daemon
+        self.key = key
 
         self._processes = dict()
         self._pid = os.getpid()
@@ -237,8 +242,11 @@ class server:
     def start_proc(self, job):
         fun_name = inspect.currentframe().f_code.co_name
         logger = logging.getLogger('.'.join((self.logger.name, fun_name)))
-
-        process = Process.from_job(job)
+        job = base64.b64decode(job['data'])
+        # logger.info('The encrypted job is of type {}'.format(type(job)))
+        # logger.info('The job is {}'.format(job))
+        decr_job = decrypt_msg(job, self.key)
+        process = Process.from_job(decr_job)
         self.processes[process.id] = process  # Register newly launched process.
         return process.id  # Return process id for the caller (batchmanager).
 
@@ -291,14 +299,14 @@ class server:
         if terminate_processes:
             for proc in self.processes:
                 proc.terminate()
-        if self.ns:
-            self.ns.remove(self.name)
+        # if self.ns:
+        #     self.ns.remove(self.name)
         self.daemon.shutdown()
 
     # Properties are necessary for Pyro communication.
-    @property
-    def name(self):
-        return self._name
+    # @property
+    # def name(self):
+    #     return self._name
 
     @property
     def host_name(self):
@@ -353,10 +361,6 @@ class server:
         return self._lock
 
 @click.command()
-@click.option('-N', '--name', default=socket.gethostname(), type=str,
-              help='name of the server in the network ' +
-              '(default: host)')
-
 @click.option('-H', '--host',
               default=Pyro4.socketutil.getIpAddress(None, workaround127=True),
               type=click.STRING,
@@ -377,72 +381,87 @@ class server:
               help='maximum load allowed '
                    '(default: number of detected cpu on this machine.)')
 
-@click.option('--pw', default=None, type=click.STRING,
-              help='password for secure communication')
+# @click.option('-N', '--name', default=socket.gethostname(), type=str,
+#               help='name of the server in the network ' +
+#               '(default: host)')
 
-@click.option('--ns/--no-ns', default=False,
-              help='Enable/disable contacting a name server. '
-                   '(default: --ns. If --no-ns, all other options relating to the '
-                   'name server are ignored.)')
+# Entering passwords via the command line and not on prompt is dangerous!
+# @click.option('--pw', default=None, type=click.STRING,
+#               help='password for secure communication')
 
-@click.option('--nshost', default=None, type=click.STRING,
-              help='hostname or ip address of the name server in the network '
-                   '(default: None. A network broadcast lookup is used.)')
+# Using a nameserver is deprecated!
+# @click.option('--ns/--no-ns', default=False,
+#               help='Enable/disable contacting a name server. '
+#                    '(default: --ns. If --no-ns, all other options relating to the '
+#                    'name server are ignored.)')
 
-@click.option('--nsport', default=None, type=click.INT,
-              help='the port number on which the name server is running. '
-                   '(default: None. The exact meaning depends on whether the host parameter is given: '
-                '- host parameter given: the port now means the actual name server port. '
-                '- host parameter not given: the port now means the broadcast port.)')
+# @click.option('--nshost', default=None, type=click.STRING,
+#               help='hostname or ip address of the name server in the network '
+#                    '(default: None. A network broadcast lookup is used.)')
 
-def main(name, host, port, max_proc, max_load, pw, ns, nshost, nsport):
-    """Start a server process.\n
-    A server process serves as a handle for the batch process manager and runs
-    on an individual server in the network.
+# @click.option('--nsport', default=None, type=click.INT,
+#               help='the port number on which the name server is running. '
+#                    '(default: None. The exact meaning depends on whether the host parameter is given: '
+#                 '- host parameter given: the port now means the actual name server port. '
+#                 '- host parameter not given: the port now means the broadcast port.)')
 
-    Before any server process can be started, it is necessary to start a Pyro4
-    nameserver. This nameserver can be started with
+# def main(name, host, port, max_proc, max_load, pw, ns, nshost, nsport):
+def main(host, port, max_proc, max_load):
+    """Start a new batchserver.\n
+    A batchserver is a server process that "serves" as a handle for the batchmanager
+    (which manages all processes) and runs on an individual server in the network.
 
-        pyro4-ns --host <ip address or hostname of hosting server> &
+    The password will be used to secure the communication between the batchserver and
+    the batchmanager. It is necessary that the passwords of all batchservers match
+    with the password of the batchmanager to which they will be connected.
 
-    The hostname can be obtain from the command line by typing 'hostname'.
-    It is sufficient to start a single nameserver in the network.
-
-    When a server is started, it automatically registers itself in
-    the nameserver and can be retrieved and accessed by the manager from there.
+    After starting the batchserver and entering the password, the URI
+    (uniform resource identifier) of the batchmanager instance will be printed to the
+    console. This is needed when connecting the batchmanager to it.
     """
+
     # Pyro4.config.SERIALIZERS_ACCEPTED.add('dill')  # Accept pickle as incoming serialization format.
-    key = get_hmac_key(pw, salt)
-    del pw
-    print(key)
+
+    try:
+        pw = getpass.getpass()
+    except Exception as err:
+        print('ERROR:', err)
+    else:
+        key = get_hmac_key(pw, salt)
+        del pw
+
+    # module_logger.info('key : {}'.format(key))
+
     with Pyro4.Daemon(host=host, port=port) as daemon:
         daemon._pyroHmacKey = key
-        batchserver = server(name=name, host=host,
-                          max_proc=max_proc, max_load=max_load,
-                          ns=None,
-                          daemon=daemon)
+        # batchserver = server(name=name, host=host,
+        #                      max_proc=max_proc, max_load=max_load,
+        #                      ns=None,
+        #                      daemon=daemon)
+        batchserver = server(host=host, max_proc=max_proc, max_load=max_load, daemon=daemon, key=key)
         batchserver_uri = daemon.register(batchserver)
         uri = daemon.uriFor('batchserver')
 
-        if ns:
-            # Try to register the daemon in a name server.
-            try:
-                with Pyro4.locateNS(host=nshost, port=nsport,
-                                    broadcast=True, hmac_key=key) as ns:
-                    try:
-                        ns.register(name, uri=batchserver_uri, safe=False)
-                    except Pyro4.errors.NamingError as err:
-                        print('{} is already registered in the name server, '.format(name) +
-                              'use a different one!')
-                        raise
-                    else:
-                        batchserver.ns = ns
+        ## Using a nameserver is deprecated!
+        # if ns:
+        #     # Try to register the daemon in a name server.
+        #     try:
+        #         with Pyro4.locateNS(host=nshost, port=nsport,
+        #                             broadcast=True, hmac_key=key) as ns:
+        #             try:
+        #                 ns.register(name, uri=batchserver_uri, safe=False)
+        #             except Pyro4.errors.NamingError as err:
+        #                 print('{} is already registered in the name server, '.format(name) +
+        #                       'use a different one!')
+        #                 raise
+        #             else:
+        #                 batchserver.ns = ns
 
-            except ConnectionRefusedError as err:
-                print('Connection to a name server failed. '
-                      'The batchserver will not be registered in a name server. '
-                      'Directly use the printed uri for registring the batchserver in '
-                      'the batchmanager.')
+        #     except ConnectionRefusedError as err:
+        #         print('Connection to a name server failed. '
+        #               'The batchserver will not be registered in a name server. '
+        #               'Directly use the printed uri for registring the batchserver in '
+        #               'the batchmanager.')
 
         print()
         print('host: {}'.format(uri.host))

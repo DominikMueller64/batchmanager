@@ -1,12 +1,14 @@
-import math
+import base64
 import datetime
+import hashlib
+import logging
+import math
 import os
 import pathlib
-import logging
+import pickle
 import string
-import hashlib
-import base64
-# import cryptography.fernet
+
+import cryptography.fernet
 
 # Logging.
 module_logger = logging.getLogger(__name__)
@@ -66,20 +68,20 @@ def get_hmac_key(pw, salt):
         return pw
     bpw = pw.encode('utf-8')
     key = hashlib.pbkdf2_hmac(hash_name='sha256', password=bpw,
-                              salt=salt, iterations=100000)
+                              salt=salt, iterations=int(1e6))
     return base64.urlsafe_b64encode(key)
 
-# def encrypt_msg(msg, key):
-#     cipher_suite = cryptography.fernet.Fernet(key)
-#     # Serialize the python object using pickle.
-#     msg = pickle.dumps(msg)
-#     # Encrypt the message based on the generated key.
-#     return cipher_suite.encrypt(msg)
+def encrypt_msg(msg, key):
+    cipher_suite = cryptography.fernet.Fernet(key)
+    # Serialize the python object using pickle.
+    msg = pickle.dumps(msg)
+    # Encrypt the message based on the generated key.
+    encr_msg = cipher_suite.encrypt(msg)
+    return base64.b64encode(encr_msg)
 
-# def decrypt_msg(msg, key):
-#     cipher_suite = cryptography.fernet.Fernet(key)
-#     # Decipher the encrypted message and deserialize it.
-#     msg = cipher_suite.decrypt(msg)
-#     return pickle.loads(msg)
-
-
+def decrypt_msg(msg, key):
+    cipher_suite = cryptography.fernet.Fernet(key)
+    # Decipher the encrypted message and deserialize it.
+    msg = base64.b64decode(msg)
+    msg = cipher_suite.decrypt(msg)
+    return pickle.loads(msg)
