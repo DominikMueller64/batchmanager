@@ -1,0 +1,12 @@
+[
+  {
+    "grp": 2,
+    "priority": 2,
+    "script": "./R_test.R",
+    "mem": 500
+  },
+  {
+    "priority": 1,
+    "script": "./R_test.R"
+  }
+]

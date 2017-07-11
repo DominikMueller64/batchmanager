@@ -1,7 +1,16 @@
 README.rst
+appJar/__init__.py
+appJar/appjar.py
+appJar/lib/TkDND_wrapper.py
+appJar/lib/__init__.py
+appJar/lib/nanojpeg.py
+appJar/lib/png.py
+appJar/lib/tkinter_png.py
+appJar/lib/tooltip.py
 batchmanager/__init__.py
 batchmanager/async_reader.py
 batchmanager/batchmanager.py
+batchmanager/batchmanager_gui.py
 batchmanager/batchserver.py
 batchmanager/example_db.py
 batchmanager/functions.py
@@ -10,6 +19,7 @@ batchmanager/launcher.py
 batchmanager/test.py
 batchmanager/test_rapid_cycling.py
 batchmanager/test_threading.py
+batchmanager/tkinter_testing.py
 batchmanager.egg-info/PKG-INFO
 batchmanager.egg-info/SOURCES.txt
 batchmanager.egg-info/dependency_links.txt

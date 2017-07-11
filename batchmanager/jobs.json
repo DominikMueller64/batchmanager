@@ -1,0 +1,32 @@
+[
+  {
+    "grp": 2,
+    "priority": 2,
+    "prefix": [
+      "/usr/bin/Rscript",
+      "--vanilla"
+    ],
+    "script": "./R_test.R",
+    "args": [
+      "20",
+      "wein",
+      "5.2"
+    ],
+    "mem": 500
+  },
+  {
+    "grp": 1,
+    "priority": 1,
+    "prefix": [
+      "/usr/bin/Rscript",
+      "--vanilla"
+    ],
+    "script": "./R_test.R",
+    "args": [
+      "30",
+      "brot",
+      "8.4"
+    ],
+    "mem": 531
+  }
+]
